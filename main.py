@@ -510,6 +510,22 @@ def review(
     headers = [cell.value for cell in ws[1]]
     idx = {name: i for i, name in enumerate(headers)}
 
+    def needs_review_check(row_data: dict) -> bool:
+        """Check if a student needs review even if already approved."""
+        # Check if score is perfect (consider override if present)
+        total_max = float(row_data.get("total_max", 100) or 100)
+        override_score = row_data.get("reviewer_override_score")
+        if override_score is not None and override_score != "":
+            try:
+                current_score = float(override_score)
+            except (ValueError, TypeError):
+                current_score = float(row_data.get("total_score", 0) or 0)
+        else:
+            current_score = float(row_data.get("total_score", 0) or 0)
+        has_notes = bool(str(row_data.get("reviewer_notes") or "").strip())
+        # Needs review if not perfect score and no notes, even if approved
+        return current_score < total_max and not has_notes
+
     rows: list[tuple[int, dict]] = []
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not row[idx["student_id"]]:
@@ -517,7 +533,9 @@ def review(
         row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
         if needs_review_only and row_data.get("needs_review") != "YES":
             continue
-        if not all_students and str(row_data.get("approved", "")).upper() == "YES":
+        # Skip approved students only if they don't need review for missing notes
+        is_approved = str(row_data.get("approved", "")).upper() == "YES"
+        if not all_students and is_approved and not needs_review_check(row_data):
             continue
         rows.append((row_idx, row_data))
 
@@ -560,7 +578,9 @@ def review(
                 row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
                 if needs_review_only and row_data.get("needs_review") != "YES":
                     continue
-                if not all_students and str(row_data.get("approved", "")).upper() == "YES":
+                # Skip approved students only if they don't need review for missing notes
+                is_approved = str(row_data.get("approved", "")).upper() == "YES"
+                if not all_students and is_approved and not needs_review_check(row_data):
                     continue
                 rows.append((row_idx, row_data))
             console.print(f"[green]{len(rows)} student(s) remaining to review after auto-approve.[/green]")
