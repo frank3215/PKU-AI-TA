@@ -86,8 +86,19 @@ def grade(
         return [], set()
 
     # Load checkpoint if resuming or regrading unapproved
+    unapproved_student_ids: set[str] = set()
     if resume or regrade_unapproved:
         all_results, processed_ids = load_checkpoint()
+        if regrade_unapproved and checkpoint_path.exists():
+            # For --regrade-unapproved, find students who are NOT approved
+            # These are the ones we need to regrade
+            try:
+                from review.spreadsheet import load_reviewed
+                all_records = load_reviewed(checkpoint_path)
+                unapproved_student_ids = {r.result.student_id for r in all_records if not r.approved}
+                console.print(f"[bold cyan]Regrade mode:[/bold cyan] Found {len(unapproved_student_ids)} unapproved student(s) to regrade")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not determine unapproved students: {e}[/yellow]")
     else:
         all_results = []
         processed_ids = set()
@@ -98,11 +109,17 @@ def grade(
         console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
         raise typer.Exit(1)
 
-    whitelist_ids: set[str] = (
-        {s.strip() for s in whitelist.split(",") if s.strip()}
-        if whitelist
-        else settings.whitelist_ids
-    )
+    # Determine whitelist:
+    # - If --regrade-unapproved: only regrade unapproved students
+    # - Else: use CLI whitelist or settings whitelist
+    if regrade_unapproved and unapproved_student_ids:
+        whitelist_ids: set[str] = unapproved_student_ids
+    else:
+        whitelist_ids: set[str] = (
+            {s.strip() for s in whitelist.split(",") if s.strip()}
+            if whitelist
+            else settings.whitelist_ids
+        )
 
     if not rubric.exists():
         console.print(f"[red]Error:[/red] Rubric file not found: {rubric}")
