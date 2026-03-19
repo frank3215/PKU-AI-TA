@@ -32,7 +32,7 @@ def grade(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
     resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
     regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
-    lang: Annotated[str, typer.Option(help="LLM prompt language: en or zh")] = "en",
+    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_en.md)")] = Path("prompts/system_en.md"),
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -178,7 +178,7 @@ def grade(
                 console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
 
             total_submissions = len(submissions)
-            console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, lang={lang})…")
+            console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, prompt={prompt.name})…")
             console.print(f"  [dim]Press Ctrl-C to interrupt — progress will be saved[/dim]")
 
             # Use transient=False for verbose mode so results stay on screen
@@ -195,7 +195,7 @@ def grade(
                 completed_count = 0
 
                 with ThreadPoolExecutor(max_workers=settings.ta_threads) as executor:
-                    futures = {executor.submit(score_submission, sub, rubric_text, lang): sub for sub in submissions}
+                    futures = {executor.submit(score_submission, sub, rubric_text, prompt): sub for sub in submissions}
                     for future in as_completed(futures):
                         sub = futures[future]
                         try:
