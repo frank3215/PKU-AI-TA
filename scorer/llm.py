@@ -176,9 +176,28 @@ def _extract_text(attachment: Attachment) -> str:
         return f"(Unknown file format for {attachment.filename})"
 
 
-def _needs_vision(text: str) -> bool:
+def _pdf_has_embedded_images(data: bytes) -> bool:
+    """Check if a PDF has embedded images (indicating it's a scanned PDF)."""
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(stream=data, filetype="pdf")
+        for page in doc:
+            if page.get_images(full=True):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     if any(marker in text for marker in _UNREADABLE_MARKERS):
         return True
+
+    # If PDF has embedded images, use vision mode (avoids OCR text layer issues)
+    if attachment and attachment.filename.lower().endswith('.pdf'):
+        if _pdf_has_embedded_images(attachment.data):
+            return True
+
     # Very short extracted text almost certainly means watermarks only, not real content
     return len(text.strip()) < 200
 
@@ -212,7 +231,7 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
     the raw image bytes as image_url so the model can read them visually.
     """
     text = _extract_text(attachment)
-    if not _needs_vision(text):
+    if not _needs_vision(text, attachment):
         return [{"type": "text", "text": f"**File: {attachment.filename}**\n\n{text}"}]
 
     data = attachment.data

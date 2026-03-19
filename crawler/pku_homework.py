@@ -147,34 +147,48 @@ class PKUHomeworkCrawler:
     def _fetch_batch_zip(
         self, students: list[dict], grade_book_pk: str, title: str
     ) -> list[Submission]:
-        """Download all files at once via downloadBatch.do ZIP."""
-        zip_resp = self.client.get(
-            f"{HW_BASE}/downloadBatch.do",
-            params={"course_id": self.course_id, "gradeBookPK": grade_book_pk, "isGroup": "false"},
-        )
-        zip_resp.raise_for_status()
+        """Download all files at once via downloadBatch.do ZIP.
 
-        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-            zip_files = [(name, zf.read(name)) for name in zf.namelist()]
+        Falls back to per-student fetching if batch download fails."""
+        try:
+            zip_resp = self.client.get(
+                f"{HW_BASE}/downloadBatch.do",
+                params={"course_id": self.course_id, "gradeBookPK": grade_book_pk, "isGroup": "false"},
+            )
+            zip_resp.raise_for_status()
 
-        submissions: list[Submission] = []
-        for student, (filename, file_bytes) in zip(students, zip_files):
-            student_id = student["userId"]
-            submissions.append(Submission(
-                student_id=student_id,
-                student_name=student["name"],
-                assignment_id=grade_book_pk,
-                assignment_title=title,
-                bb_user_id=self._bb_user_map.get(student_id, ""),
-                attachments=[Attachment(
-                    filename=filename,
-                    content_type=_guess_mime(filename),
-                    data=file_bytes,
-                )],
-                submitted_at=student.get("submitted_at", ""),
-                already_graded=student.get("already_graded", False),
-            ))
-        return submissions
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                zip_files = [(name, zf.read(name)) for name in zf.namelist()]
+
+            submissions: list[Submission] = []
+            for student, (filename, file_bytes) in zip(students, zip_files):
+                student_id = student["userId"]
+                submissions.append(Submission(
+                    student_id=student_id,
+                    student_name=student["name"],
+                    assignment_id=grade_book_pk,
+                    assignment_title=title,
+                    bb_user_id=self._bb_user_map.get(student_id, ""),
+                    attachments=[Attachment(
+                        filename=filename,
+                        content_type=_guess_mime(filename),
+                        data=file_bytes,
+                    )],
+                    submitted_at=student.get("submitted_at", ""),
+                    already_graded=student.get("already_graded", False),
+                ))
+            return submissions
+        except (httpx.HTTPStatusError, zipfile.BadZipFile) as e:
+            # Fall back to per-student fetching if batch download fails
+            import sys
+            print(f"  [yellow]Batch download failed (will fetch individually): {e}[/yellow]", file=sys.stderr)
+            # Temporarily set whitelist to all students to trigger per-student fetch
+            original_whitelist = self.whitelist
+            self.whitelist = {s["userId"] for s in students}
+            try:
+                return self._fetch_per_student(students, grade_book_pk, title)
+            finally:
+                self.whitelist = original_whitelist
 
     def _download_student_file(
         self, grade_book_pk: str, title: str, user_id: str, file_pk: str, attempt_pk: str
