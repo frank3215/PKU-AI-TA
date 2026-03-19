@@ -2,7 +2,7 @@
 
 Automatically grades student homework submissions from [course.pku.edu.cn](https://course.pku.edu.cn) (Blackboard Learn) using an LLM, exports results to Excel for human review, and submits approved scores back to the platform.
 
-**Workflow:** crawl submissions → LLM scores against rubric → review in Excel → submit scores
+**Workflow:** crawl submissions → LLM scores against rubric → review (TUI or Excel) → submit scores
 
 ---
 
@@ -10,7 +10,7 @@ Automatically grades student homework submissions from [course.pku.edu.cn](https
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) package manager
-- A [OpenRouter](https://openrouter.ai) API key (or any OpenAI-compatible endpoint)
+- An [OpenRouter](https://openrouter.ai) API key (or any OpenAI-compatible endpoint)
 - PKU IAAA credentials (student/staff ID + password)
 
 ---
@@ -37,10 +37,12 @@ Key variables in `.env`:
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | Your OpenRouter API key |
+| `OPENAI_BASE_URL` | API endpoint (default: `https://openrouter.ai/api/v1`) |
 | `TA_MODEL` | Model to use, e.g. `qwen/qwen3.5-397b-a17b` |
 | `PKU_USERNAME` | Your PKU student/staff ID |
 | `PKU_PASSWORD` | Your PKU password |
 | `COURSE_ID` | Blackboard course ID, e.g. `_98024_1` (from the course URL) |
+| `REVIEW_THRESHOLD` | Confidence below this → flagged yellow for review (default: `0.75`) |
 
 **3. Prepare your rubric**
 
@@ -87,6 +89,17 @@ uv run python main.py grade \
   --rubric rubric.md \
   --whitelist $(cat student_list | tr '\n' ',' | sed 's/,$//') \
   --out scores.xlsx
+
+# Use the Chinese system prompt
+uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
+  --prompt prompts/system_zh.md
+
+# Interrupt with Ctrl-C and resume later
+uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md --resume
+
+# Keep already-approved students, regrade the rest
+uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
+  --regrade-unapproved
 ```
 
 | Flag | Description |
@@ -96,11 +109,15 @@ uv run python main.py grade \
 | `--rubric` | Path to your rubric Markdown file |
 | `--whitelist` | Comma-separated student IDs to grade; omit to grade everyone |
 | `--out` | Output Excel file (default: `scores.xlsx`) |
+| `--prompt` | System prompt file for the LLM (default: `prompts/system_en.md`) |
+| `--verbose` / `-v` | Print each student's result as it's scored |
+| `--resume` / `-r` | Resume a previously interrupted run |
+| `--regrade-unapproved` | Keep approved students, regrade the rest |
 
 This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence and need manual review.
 
 > **Finding `--course` (course ID):**
-> Navigate to any page of your course on course.pku.edu.cn. The URL contains `course_id=_98024_1` — copy that value including the underscores, e.g. `_98024_1`.
+> Navigate to any page of your course on course.pku.edu.cn. The URL contains `course_id=_98024_1` — copy that value including the underscores.
 >
 > **Finding `--column` (assignment ID):**
 > Go to the homework list, click **查看** next to any assignment. The URL of the student list page looks like:
@@ -111,10 +128,48 @@ This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence
 
 ### Step 2 — Review
 
-Open `scores.xlsx`. For each student you want to finalise:
+#### Option A: Interactive TUI (recommended)
 
-1. Check the LLM's `breakdown_json` and `llm_reasoning` columns.
-2. Optionally override the score in `reviewer_override_score`.
+```bash
+# Review only students flagged for review
+uv run python main.py review --needs-review
+
+# Review all students
+uv run python main.py review --all
+
+# Auto-approve perfect scores, then review the rest
+uv run python main.py review --auto-approve --needs-review
+```
+
+TUI key bindings:
+
+| Key | Action | Stays on page |
+|---|---|---|
+| `a` | Approve and advance to next student | No |
+| `e` | Edit individual criterion scores interactively | Yes |
+| `n` | Add / edit reviewer notes | Yes |
+| `ov` | Set override score | Yes |
+| `o` | Open submission file with system viewer | Yes |
+| `r` | Open rubric file | Yes |
+| `s` | Skip (do not approve), advance to next | No |
+| `b` | Go back to previous student | No |
+| `q` | Quit | — |
+
+| Flag | Description |
+|---|---|
+| `--scores` | Excel file to review (default: `scores.xlsx`) |
+| `--submissions` | Directory with submission files (default: `submissions/`) |
+| `--rubric` | Rubric file to open with `r` (default: `rubric.md`) |
+| `--needs-review` / `-n` | Only show students flagged as needing review |
+| `--all` / `-a` | Show all students, including already-approved |
+| `--auto-approve` | Automatically approve 100/100 students with no uncertain parts |
+
+#### Option B: Edit Excel directly
+
+Open `scores.xlsx`. For each student:
+
+1. Check `breakdown_json` and `llm_reasoning`.
+2. Optionally set `reviewer_override_score`.
 3. Add notes in `reviewer_notes`.
 4. Set `approved` to **YES**.
 
@@ -129,13 +184,30 @@ uv run python main.py submit \
   --course _98024_1 \
   --column 423829 \
   --scores scores.xlsx
-```
 
-Use `--dry-run` to preview what would be submitted without posting anything:
-
-```bash
+# Preview without posting
 uv run python main.py submit --course _98024_1 --column 423829 --scores scores.xlsx --dry-run
 ```
+
+---
+
+## Customising the system prompt
+
+Built-in prompts live in `prompts/`:
+
+| File | Language |
+|---|---|
+| `prompts/system_en.md` | English (default) |
+| `prompts/system_zh.md` | Chinese |
+
+Pass any prompt file to `--prompt`:
+
+```bash
+uv run python main.py grade ... --prompt prompts/system_zh.md
+uv run python main.py grade ... --prompt my_custom_prompt.md
+```
+
+The prompt files are plain Markdown — edit them directly to adjust grading philosophy, tone, or output format without touching code.
 
 ---
 
@@ -144,11 +216,11 @@ uv run python main.py submit --course _98024_1 --column 423829 --scores scores.x
 | File type | How it's processed |
 |---|---|
 | Text-embedded PDF | Text extracted with `pypdf`, sent to LLM as text |
-| Scanned PDF | Original JPEG/PNG images extracted from PDF via `pymupdf`, sent as images |
-| Submitted JPEG/PNG | Sent directly as images |
+| Scanned / image PDF | Pages rendered at 2× scale via `pymupdf`, sent as images |
+| Submitted JPEG / PNG | Sent directly as images |
 | Word (.docx) | Text extracted with `python-docx` |
 
-The LLM is instructed to give students the benefit of the doubt and state explicit reasons for every point deducted.
+The LLM is instructed to give students the benefit of the doubt: every deduction must have an explicit reason and point amount. Uncertain parts are flagged for human review rather than penalised.
 
 ---
 

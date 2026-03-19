@@ -282,8 +282,8 @@ def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown:
     console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
     return breakdown
 
-def handle_override(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> bool:
-    """Handle the 'override' action."""
+def handle_override(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
+    """Handle the 'override' action. Sets override score and stays on current student."""
     current_override = row_data.get("reviewer_override_score", "")
     if current_override:
         console.print(f"\n[bold]Current override:[/bold] {current_override}")
@@ -293,14 +293,10 @@ def handle_override(session: ReviewSession, row_idx: int, row_data: dict, consol
             score_val = float(new_score)
             row_data["reviewer_override_score"] = score_val
             session.ws.cell(row=row_idx, column=session.idx["reviewer_override_score"] + 1, value=score_val)
-            session.ws.cell(row=row_idx, column=session.idx["approved"] + 1, value="YES")
-            row_data["approved"] = "YES"
             session.update_row(row_idx, row_data)
-            console.print(f"[green]Set override score: {score_val} and marked as approved.[/green]")
-            return True
+            console.print(f"[green]Override score set to {score_val}. Use (a) to approve.[/green]")
         except ValueError:
             console.print("[red]Invalid score[/red]")
-    return False
 
 def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, float]:
     """Interactive editor for breakdown. Returns (new_breakdown, new_total, new_max)."""

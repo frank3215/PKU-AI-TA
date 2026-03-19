@@ -14,11 +14,14 @@ import base64
 import io
 import json
 import re
+from pathlib import Path
 
 from openai import OpenAI
 
 from config import settings
 from models import Attachment, CriterionScore, ScoringResult, Submission, UncertainPart
+
+_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 _client: OpenAI | None = None
 
@@ -43,100 +46,17 @@ def _get_client() -> OpenAI:
     return _client
 
 
-SYSTEM_PROMPT_EN = """\
-You are a kind and supportive teaching assistant grading student homework for an \
-Algorithm Design and Analysis course.
-
-Grading philosophy:
-- Default to FULL marks. Only deduct when you have clear, direct evidence of an error \
-or a genuinely missing required component visible in the submission.
-- When in doubt — if you are unsure whether something is correct, incomplete, or \
-missing — do NOT deduct. Award full marks for that part and record it in uncertain_parts \
-for human review instead.
-- Every deduction MUST be accompanied by an explicit reason and the exact points deducted \
-(e.g. "deduct 2 pts: space complexity analysis is absent"). No reason = no deduction.
-- Never deduct speculatively, for things you cannot clearly see, or because a step \
-"might" be wrong.
-
-Return ONLY a JSON object (no markdown fences, no extra text):
-{
-  "total_score": <float>,
-  "total_max": <float>,
-  "confidence": <float 0–1>,
-  "breakdown": [
-    {
-      "criterion": "<problem number and name, e.g. 1.2 Selection Sort>",
-      "points_awarded": <float>,
-      "points_max": <float>,
-      "reasoning": "<describe what is correct; for any deduction write: 'deduct X pts: <specific reason>'. If no deduction, state why full marks are awarded.>"
-    }
-  ],
-  "uncertain_parts": [
-    {
-      "description": "<part you are unsure about — full marks already awarded, flagged for human to verify>",
-      "suggested_score": <float>,
-      "suggested_max": <float>
-    }
-  ],
-  "llm_reasoning": "<brief overall summary: strengths, confirmed deductions with reasons, uncertain parts>"
-}
-
-Rules:
-- List EVERY rubric criterion in breakdown, even if full marks.
-- If a part is uncertain, award full marks AND list it in uncertain_parts (do not deduct).
-- confidence < 0.75 → you are unsure about the overall score; list ambiguous parts in uncertain_parts.
-- Do NOT invent criteria not in the rubric.
-- All numeric fields must be numbers, never null.
-"""
-
-SYSTEM_PROMPT_ZH = """\
-你是一位友善且乐于助人的助教，正在为《算法设计与分析》课程批改学生作业。
-
-评分原则：
-- 默认给满分。只有当你有明确、直接的证据证明作业中有错误，或者确实缺少要求的内容时，才扣分。
-- 如有疑问 —— 如果你不确定某部分是否正确、完整或缺失 —— 不要扣分。给这部分打满分，并将其记录在 uncertain_parts 中供人工复核。
-- 每一项扣分都必须有明确的理由和具体的扣分数（例如："扣2分：缺少空间复杂度分析"）。没有理由 = 不扣分。
-- 永远不要因为看不清、或某一步"可能"错误而猜测性地扣分。
-
-只返回一个JSON对象（不要markdown格式，不要额外文字）：
-{
-  "total_score": <float>,
-  "total_max": <float>,
-  "confidence": <float 0–1>,
-  "breakdown": [
-    {
-      "criterion": "<题目编号和名称，例如：1.2 选择排序>",
-      "points_awarded": <float>,
-      "points_max": <float>,
-      "reasoning": "<描述正确的部分；如有扣分，请写：'扣X分：<具体原因>'。如果没有扣分，说明为什么给满分。>"
-    }
-  ],
-  "uncertain_parts": [
-    {
-      "description": "<你不确定的部分 —— 已给满分，标记供人工核实>",
-      "suggested_score": <float>,
-      "suggested_max": <float>
-    }
-  ],
-  "llm_reasoning": "<简要的整体总结：优点、确认的扣分及理由、不确定的部分>"
-}
-
-规则：
-- 在 breakdown 中列出评分标准中的每一项，即使是满分也要列出。
-- 如果某部分不确定，给满分并在 uncertain_parts 中列出（不要扣分）。
-- confidence < 0.75 → 你对整体评分不确定；在 uncertain_parts 中列出模糊不清的部分。
-- 不要编造评分标准中没有的评判项。
-- 所有数值字段必须是数字，不能为null。
-"""
-
-SYSTEM_PROMPT = SYSTEM_PROMPT_EN
+_DEFAULT_PROMPT = _PROMPTS_DIR / "system_en.md"
 
 
-def get_system_prompt(language: str = "en") -> str:
-    """Get the system prompt in the specified language ("en" or "zh")."""
-    if language.lower() in ("zh", "cn", "chinese", "中文"):
-        return SYSTEM_PROMPT_ZH
-    return SYSTEM_PROMPT_EN
+def get_system_prompt(path: Path) -> str:
+    """Load the system prompt from a file path."""
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(
+        f"System prompt file not found: {path}\n"
+        f"Built-in prompts are in {_PROMPTS_DIR}/: system_en.md, system_zh.md"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +193,16 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
 # Main scoring function
 # ---------------------------------------------------------------------------
 
-def score_submission(submission: Submission, rubric: str, language: str = "en") -> ScoringResult:
-    """Score a single submission against the rubric using the LLM."""
+def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAULT_PROMPT) -> ScoringResult:
+    """Score a single submission against the rubric using the LLM.
+
+    Args:
+        submission: The student submission to score.
+        rubric: The rubric text.
+        prompt: Path to the system prompt file. Defaults to prompts/system_en.md.
+    """
+    system_prompt = get_system_prompt(prompt)
+
     content: list[dict] = [
         {"type": "text", "text": f"## Scoring Rubric\n\n{rubric}\n\n## Student Submission"},
     ]
@@ -296,7 +224,7 @@ def score_submission(submission: Submission, rubric: str, language: str = "en") 
     response = _get_client().chat.completions.create(
         model=settings.ta_model,
         messages=[
-            {"role": "system", "content": get_system_prompt(language)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
         temperature=0.2,

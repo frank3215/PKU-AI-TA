@@ -187,7 +187,12 @@ def run_review_tui(
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
-            action = Prompt.ask("[bold cyan]Action[/bold cyan]", choices=choices, default="skip")
+            action = Prompt.ask(
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
+                choices=choices,
+                default="skip",
+                show_choices=False,
+            )
 
             if action in ("q", "quit"):
                 console.print("[yellow]Quitting...[/yellow]")
@@ -212,8 +217,7 @@ def run_review_tui(
                 else:
                     console.print(f"[yellow]Rubric file not found: {rubric}[/yellow]")
             elif action in ("ov", "override"):
-                if handle_override(session, row_idx, row_data, console):
-                    session.next_student()
+                handle_override(session, row_idx, row_data, console)
             else: # skip
                 console.print("[dim]Skipped.[/dim]")
                 session.next_student()
