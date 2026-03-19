@@ -42,14 +42,14 @@ HW_BASE = "/webapps/bb-homeWorkCheck-BBLEARN/homeWorkCheck"
 BB_API = "/learn/api/public/v1"
 
 # getStudentWork.do has two submission link formats:
-#   1. href="...CheckAloneWork.do?...userId=X&filePk=Y&...&attemptPk=Z" (older students, 查看)
-#   2. onclick="checkWork('userId','filePk','attemptPk')"               (newer students, 批改)
+#   1. href="...CheckAloneWork.do?...userId=X&filePk=Y&...&attemptPk=Z">查看</a> (already graded)
+#   2. onclick="checkWork('userId','filePk','attemptPk')">批改</a> (needs grading)
 _STUDENT_PATTERN = re.compile(
-    r'CheckAloneWork\.do\?course_id=[^&]+&gradeBookPK=(\d+)'
-    r'&userId=(\d+)&filePk=(\d+)&title=([^&"]+)&attemptPk=(\d+)'
+    r'<a[^>]*CheckAloneWork\.do\?course_id=[^&]+&gradeBookPK=(\d+)'
+    r'&userId=(\d+)&filePk=(\d+)&title=([^&"]+)&attemptPk=(\d+)[^>]*>([^<]+)</a>'
 )
 _STUDENT_ONCLICK_PATTERN = re.compile(
-    r"""onclick=['"]\s*checkWork\(\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*\)"""
+    r"""onclick=['"]\s*checkWork\(\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*\)[^>]*>([^<]+)</a>"""
 )
 _NAME_PATTERN = re.compile(
     r'scope="row"[^>]*>\s*(\d{10})\s*</th>.*?table-data-cell-value">(.*?)</span>',
@@ -140,6 +140,7 @@ class PKUHomeworkCrawler:
                 bb_user_id=self._bb_user_map.get(student_id, ""),
                 attachments=[Attachment(filename=filename, content_type=content_type, data=file_bytes)],
                 submitted_at=student.get("submitted_at", ""),
+                already_graded=student.get("already_graded", False),
             ))
         return submissions
 
@@ -171,6 +172,7 @@ class PKUHomeworkCrawler:
                     data=file_bytes,
                 )],
                 submitted_at=student.get("submitted_at", ""),
+                already_graded=student.get("already_graded", False),
             ))
         return submissions
 
@@ -268,38 +270,44 @@ def _parse_student_list(html: str) -> list[dict]:
     """Extract submitted student list from getStudentWork.do HTML.
 
     Handles two link formats:
-    - CheckAloneWork.do href (older cohort, 查看)
-    - onclick="checkWork('userId','filePk','attemptPk')" (newer cohort, 批改)
+    - CheckAloneWork.do href with "查看" (view, already graded)
+    - onclick="checkWork('userId','filePk','attemptPk')" with "批改" (grade, needs grading)
+
+    For students with multiple attempts, keeps the newest one (highest attemptPk).
+    Adds an 'already_graded' field to indicate if the attempt is already graded.
     """
     names = {m.group(1): m.group(2).strip() for m in _NAME_PATTERN.finditer(html)}
-    students = []
-    seen: set[str] = set()
+    student_map: dict[str, dict] = {}  # userId -> best attempt
 
     for m in _STUDENT_PATTERN.finditer(html):
-        _, user_id, file_pk, title_enc, attempt_pk = m.groups()
-        if user_id in seen:
-            continue
-        seen.add(user_id)
-        students.append({
+        _, user_id, file_pk, title_enc, attempt_pk, link_text = m.groups()
+        already_graded = link_text.strip() == "查看"
+        attempt = {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
-        })
+            "already_graded": already_graded,
+        }
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
+            student_map[user_id] = attempt
 
     for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
-        user_id, file_pk, attempt_pk = m.groups()
-        if user_id in seen:
-            continue
-        seen.add(user_id)
-        students.append({
+        user_id, file_pk, attempt_pk, link_text = m.groups()
+        already_graded = link_text.strip() == "查看"
+        attempt = {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
-        })
+            "already_graded": already_graded,
+        }
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
+            student_map[user_id] = attempt
 
-    return students
+    return list(student_map.values())
 
 
 def _guess_mime(filename: str) -> str:

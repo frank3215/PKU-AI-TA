@@ -43,7 +43,7 @@ def _get_client() -> OpenAI:
     return _client
 
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_EN = """\
 You are a kind and supportive teaching assistant grading student homework for an \
 Algorithm Design and Analysis course.
 
@@ -88,6 +88,55 @@ Rules:
 - Do NOT invent criteria not in the rubric.
 - All numeric fields must be numbers, never null.
 """
+
+SYSTEM_PROMPT_ZH = """\
+你是一位友善且乐于助人的助教，正在为《算法设计与分析》课程批改学生作业。
+
+评分原则：
+- 默认给满分。只有当你有明确、直接的证据证明作业中有错误，或者确实缺少要求的内容时，才扣分。
+- 如有疑问 —— 如果你不确定某部分是否正确、完整或缺失 —— 不要扣分。给这部分打满分，并将其记录在 uncertain_parts 中供人工复核。
+- 每一项扣分都必须有明确的理由和具体的扣分数（例如："扣2分：缺少空间复杂度分析"）。没有理由 = 不扣分。
+- 永远不要因为看不清、或某一步"可能"错误而猜测性地扣分。
+
+只返回一个JSON对象（不要markdown格式，不要额外文字）：
+{
+  "total_score": <float>,
+  "total_max": <float>,
+  "confidence": <float 0–1>,
+  "breakdown": [
+    {
+      "criterion": "<题目编号和名称，例如：1.2 选择排序>",
+      "points_awarded": <float>,
+      "points_max": <float>,
+      "reasoning": "<描述正确的部分；如有扣分，请写：'扣X分：<具体原因>'。如果没有扣分，说明为什么给满分。>"
+    }
+  ],
+  "uncertain_parts": [
+    {
+      "description": "<你不确定的部分 —— 已给满分，标记供人工核实>",
+      "suggested_score": <float>,
+      "suggested_max": <float>
+    }
+  ],
+  "llm_reasoning": "<简要的整体总结：优点、确认的扣分及理由、不确定的部分>"
+}
+
+规则：
+- 在 breakdown 中列出评分标准中的每一项，即使是满分也要列出。
+- 如果某部分不确定，给满分并在 uncertain_parts 中列出（不要扣分）。
+- confidence < 0.75 → 你对整体评分不确定；在 uncertain_parts 中列出模糊不清的部分。
+- 不要编造评分标准中没有的评判项。
+- 所有数值字段必须是数字，不能为null。
+"""
+
+SYSTEM_PROMPT = SYSTEM_PROMPT_EN
+
+
+def get_system_prompt(language: str = "en") -> str:
+    """Get the system prompt in the specified language ("en" or "zh")."""
+    if language.lower() in ("zh", "cn", "chinese", "中文"):
+        return SYSTEM_PROMPT_ZH
+    return SYSTEM_PROMPT_EN
 
 
 # ---------------------------------------------------------------------------
@@ -135,41 +184,23 @@ def _needs_vision(text: str) -> bool:
 
 
 def _pdf_to_image_parts(data: bytes) -> list[dict]:
-    """Extract embedded images from a scanned PDF using pymupdf.
+    """Render PDF pages to images for vision model.
 
-    Uses page.get_images() to pull original scanner JPEG/PNG bytes directly —
-    no re-encoding, no quality loss, faster than rendering via get_pixmap().
-    Falls back to page rendering if no embedded images are found.
+    Always renders pages directly rather than trying to extract embedded images,
+    because PDFs often contain non-content images (ICC profiles, thumbnails, etc.)
+    that aren't student work. Rendering ensures we see exactly what a human sees.
     """
     import fitz  # pymupdf
     doc = fitz.open(stream=data, filetype="pdf")
     parts = []
-    seen: set[int] = set()
     for page in doc:
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            if xref in seen:
-                continue
-            seen.add(xref)
-            base_image = doc.extract_image(xref)
-            img_bytes = base_image["image"]
-            ext = base_image["ext"]  # "jpeg", "png", etc.
-            mime = "image/jpeg" if ext in ("jpeg", "jpg") else f"image/{ext}"
-            b64 = base64.b64encode(img_bytes).decode()
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"},
-            })
-    if not parts:
-        # No embedded images — fall back to rendering pages
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
-            })
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat)
+        b64 = base64.b64encode(pix.tobytes("png")).decode()
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+        })
     return parts
 
 
@@ -203,13 +234,13 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}},
         ]
 
-    # Scanned PDF — extract embedded images (original quality, no re-encoding)
+    # Scanned PDF — render pages to images
     if data[:4] == b'%PDF' or fname.endswith('.pdf'):
         try:
             img_parts = _pdf_to_image_parts(data)
             if img_parts:
                 return (
-                    [{"type": "text", "text": f"**File: {attachment.filename}** (scanned — images extracted)"}]
+                    [{"type": "text", "text": f"**File: {attachment.filename}** (scanned — pages rendered)"}]
                     + img_parts
                 )
         except Exception:
@@ -223,7 +254,7 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
 # Main scoring function
 # ---------------------------------------------------------------------------
 
-def score_submission(submission: Submission, rubric: str) -> ScoringResult:
+def score_submission(submission: Submission, rubric: str, language: str = "en") -> ScoringResult:
     """Score a single submission against the rubric using the LLM."""
     content: list[dict] = [
         {"type": "text", "text": f"## Scoring Rubric\n\n{rubric}\n\n## Student Submission"},
@@ -237,12 +268,16 @@ def score_submission(submission: Submission, rubric: str) -> ScoringResult:
 
     extra: dict = {}
     if not settings.enable_thinking:
-        extra["extra_body"] = {"enable_thinking": False}
+        # Only send enable_thinking for Qwen models on platforms that support it
+        # Skip for Volcengine/other providers that don't support this parameter
+        model_name = settings.ta_model.lower()
+        if "qwen" in model_name and ("openrouter" in settings.openai_base_url or "dashscope" in settings.openai_base_url):
+            extra["extra_body"] = {"enable_thinking": False}
 
     response = _get_client().chat.completions.create(
         model=settings.ta_model,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": get_system_prompt(language)},
             {"role": "user", "content": content},
         ],
         temperature=0.2,

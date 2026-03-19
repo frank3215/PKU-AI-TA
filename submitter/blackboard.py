@@ -50,6 +50,8 @@ def _fetch_assignment_title(client: httpx.Client, course_id: str, grade_book_pk:
 def _fetch_student_meta(client: httpx.Client, course_id: str, grade_book_pk: str) -> tuple[dict[str, dict], str]:
     """
     Return ({userId: {filePk, attemptPk}}, assignment_title) by parsing getStudentWork.do.
+
+    For students with multiple attempts, keeps the newest one (highest attemptPk).
     """
     from crawler.pku_homework import _STUDENT_ONCLICK_PATTERN, _STUDENT_PATTERN
 
@@ -65,10 +67,14 @@ def _fetch_student_meta(client: httpx.Client, course_id: str, grade_book_pk: str
     meta: dict[str, dict] = {}
     for m in _STUDENT_PATTERN.finditer(html):
         _, user_id, file_pk, _, attempt_pk = m.groups()
-        meta[user_id] = {"filePk": file_pk, "attemptPk": attempt_pk}
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in meta or int(attempt_pk) > int(meta[user_id]["attemptPk"]):
+            meta[user_id] = {"filePk": file_pk, "attemptPk": attempt_pk}
     for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
         user_id, file_pk, attempt_pk = m.groups()
-        meta.setdefault(user_id, {"filePk": file_pk, "attemptPk": attempt_pk})
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in meta or int(attempt_pk) > int(meta[user_id]["attemptPk"]):
+            meta[user_id] = {"filePk": file_pk, "attemptPk": attempt_pk}
 
     return meta, title
 
