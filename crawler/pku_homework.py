@@ -56,7 +56,7 @@ _NAME_PATTERN = re.compile(
     r'scope="row"[^>]*>\s*(\d{10})\s*</th>.*?table-data-cell-value">(.*?)</span>',
     re.DOTALL,
 )
-_FILE_PATH_PATTERN = re.compile(r"var filePath = '([^']+)'")
+_FILE_PATH_PATTERN = re.compile(r"(?:var|const) filePath = '([^']+)'")
 
 
 class PKUHomeworkCrawler:
@@ -202,17 +202,17 @@ class PKUHomeworkCrawler:
         Fetch CheckWork.do to extract filePath, then download via api/pdf.do.
         Returns (file_bytes, filename, content_type) or (None, "", "") on failure.
         """
-        resp = self.client.get(
-            f"{HW_BASE}/CheckWork.do",
-            params={
-                "course_id": self.course_id,
-                "gradeBookPK": grade_book_pk,
-                "userId": user_id,
-                "filePk": file_pk,
-                "title": title,
-                "attemptPk": attempt_pk,
-            },
-        )
+        # Step 1: fetch CheckWork.do to get the JS variable filePath
+        url = f"{self.client.base_url or ''}{HW_BASE}/CheckWork.do"
+        params = {
+            "course_id": self.course_id,
+            "gradeBookPK": grade_book_pk,
+            "userId": user_id,
+            "filePk": file_pk,
+            "title": title,
+            "attemptPk": attempt_pk,
+        }
+        resp = self.client.get(url, params=params)
         resp.raise_for_status()
 
         m = _FILE_PATH_PATTERN.search(resp.text)
