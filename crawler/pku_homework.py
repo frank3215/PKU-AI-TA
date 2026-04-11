@@ -49,7 +49,8 @@ _STUDENT_PATTERN = re.compile(
     r'&userId=(\d+)&filePk=(\d+)&title=([^&"]+)&attemptPk=(\d+)[^>]*>([^<]+)</a>'
 )
 _STUDENT_ONCLICK_PATTERN = re.compile(
-    r"""onclick=['"]\s*checkWork\(\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*\)[^>]*>([^<]+)</a>"""
+    r"""onclick=['"]\s*checkWork\(\s*'(\d+)'\s*,\s*'(\d+)'\s*,\s*'(\d+)'\s*,\s*'[^']*'\s*\)"""
+    r"""[^>]*>([^<]+)</a>"""
 )
 _NAME_PATTERN = re.compile(
     r'scope="row"[^>]*>\s*(\d{10})\s*</th>.*?table-data-cell-value">(.*?)</span>',
@@ -83,8 +84,8 @@ class PKUHomeworkCrawler:
         Fetch student submissions for one assignment.
 
         Strategy:
-        - Whitelist set → per-student: CheckWork.do + api/pdf.do (2 reqs per student)
-        - No whitelist  → batch ZIP: downloadBatch.do (1 req for all files, fast)
+        - Whitelist set -> per-student: CheckWork.do + api/pdf.do (2 reqs per student)
+        - No whitelist  -> batch ZIP: downloadBatch.do (1 req for all files, fast)
         """
         self._ensure_bb_user_map()
 
@@ -93,11 +94,15 @@ class PKUHomeworkCrawler:
             params={
                 "course_id": self.course_id,
                 "gradeBookPK": grade_book_pk,
-                "title": title,
+                "title": quote(title, safe=""),
+                "sortDir": "ASCENDING",
+                "editPaging": "false",
                 "showAll": "true",
+                "startIndex": 0,
             },
         )
         resp.raise_for_status()
+
         students = _parse_student_list(resp.text)
 
         if not students:
@@ -181,7 +186,7 @@ class PKUHomeworkCrawler:
         except (httpx.HTTPStatusError, zipfile.BadZipFile) as e:
             # Fall back to per-student fetching if batch download fails
             import sys
-            print(f"  [yellow]Batch download failed (will fetch individually): {e}[/yellow]", file=sys.stderr)
+            print(f"  Batch download failed (will fetch individually): {e}", file=sys.stderr)
             # Temporarily set whitelist to all students to trigger per-student fetch
             original_whitelist = self.whitelist
             self.whitelist = {s["userId"] for s in students}
