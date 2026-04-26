@@ -173,7 +173,7 @@ def run_review_tui(
             display_student(console, row_data, i, len(session.rows), breakdown)
             student_id = str(row_data["student_id"])
             student_name = str(row_data["student_name"])
-            sub_file = find_submission_file(submissions, student_id, student_name)
+            sub_file = find_submission_file(submissions, student_id, student_name, assignment_id=session.assignment_id)
 
             if sub_file:
                 console.print(f"[bold blue]Submission:[/bold blue] {sub_file}")

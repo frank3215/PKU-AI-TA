@@ -73,17 +73,50 @@ def prompt_choice(prompt_label: str, choices: list[str], default: str | None = N
     return Prompt.ask(prompt_label, choices=choices, default=default)
 
 
-def find_submission_file(submissions_dir: Path, student_id: str, student_name: str) -> Path | None:
-    """Find submission file for a student by matching student_id in filename."""
+def find_submission_file(
+    submissions_dir: Path,
+    student_id: str,
+    student_name: str,
+    assignment_id: str | None = None,
+) -> Path | None:
+    """Find submission file for a student by matching student_id in filename.
+
+    If *assignment_id* is provided, only search inside
+    ``submissions_dir / assignment_id``.  Otherwise fall back to all
+    subdirectories (and the top-level directory) and return the most
+    recently modified match.
+    """
     if not submissions_dir.exists():
         return None
+
+    matches: list[Path] = []
+
+    # 1. Prefer exact assignment directory when we know it
+    if assignment_id:
+        exact_dir = submissions_dir / assignment_id
+        if exact_dir.is_dir():
+            for f in exact_dir.iterdir():
+                if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                    return f  # exact hit — no need to search further
+
+    # 2. Fallback: search all subdirectories
     for assignment_dir in submissions_dir.iterdir():
-        if not assignment_dir.is_dir() or assignment_dir.name.startswith(".`"):
+        if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
             continue
         for f in assignment_dir.iterdir():
             if f.is_file() and not f.name.startswith(".") and student_id in f.name:
-                return f
-    return None
+                matches.append(f)
+
+    # 3. Also check the top-level directory itself
+    for f in submissions_dir.iterdir():
+        if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+            matches.append(f)
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
 
 
 def open_file(filepath: Path, console: Console | None = None) -> None:
@@ -189,6 +222,13 @@ class ReviewSession:
         self.current_idx = 0
         self.modified_rows: dict[int, dict] = {}
         self.modified = False
+
+        # Infer assignment_id from the first row of the spreadsheet so we can
+        # locate the correct submission directory.
+        self.assignment_id: str | None = None
+        if self.rows:
+            _, first_row_data = self.rows[0]
+            self.assignment_id = str(first_row_data.get("assignment_id") or "").strip() or None
 
     def get_current_row(self) -> tuple[int, dict] | None:
         if 0 <= self.current_idx < len(self.rows):

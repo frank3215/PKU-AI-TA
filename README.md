@@ -90,6 +90,10 @@ uv run python main.py grade \
   --whitelist $(cat student_list | tr '\n' ',' | sed 's/,$//') \
   --out scores.xlsx
 
+# Save submission files to a custom directory for review
+uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
+  --save-dir ./hw1_submissions
+
 # Use the Chinese system prompt
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
   --prompt prompts/system_zh.md
@@ -109,6 +113,7 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 | `--rubric` | Path to your rubric Markdown file |
 | `--whitelist` | Comma-separated student IDs to grade; omit to grade everyone |
 | `--out` | Output Excel file (default: `scores.xlsx`) |
+| `--save-dir` | Directory to save submission files for human review (default: `submissions/`) |
 | `--prompt` | System prompt file for the LLM (default: `prompts/system_en.md`) |
 | `--verbose` / `-v` | Print each student's result as it's scored |
 | `--resume` / `-r` | Resume a previously interrupted run |
@@ -139,6 +144,9 @@ uv run python main.py review --all
 
 # Auto-approve perfect scores, then review the rest
 uv run python main.py review --auto-approve --needs-review
+
+# Review a specific spreadsheet (e.g., from a previous grading run)
+uv run python main.py review --scores scores1.xlsx --needs-review
 ```
 
 TUI key bindings:
