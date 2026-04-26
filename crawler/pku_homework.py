@@ -81,6 +81,32 @@ class PKUHomeworkCrawler:
         resp.raise_for_status()
         return _parse_homework_list(resp.text)
 
+    def count_submissions(self, grade_book_pk: str, title: str) -> dict:
+        """Return submission counts for one assignment without downloading files.
+
+        If a whitelist is set, only counts students in the whitelist.
+        Returns {"total": int, "graded": int, "ungraded": int}
+        """
+        resp = self.client.get(
+            f"{HW_BASE}/getStudentWork.do",
+            params={
+                "course_id": self.course_id,
+                "gradeBookPK": grade_book_pk,
+                "title": quote(title, safe=""),
+                "sortDir": "ASCENDING",
+                "editPaging": "false",
+                "showAll": "true",
+                "startIndex": 0,
+            },
+        )
+        resp.raise_for_status()
+        students = _parse_student_list(resp.text)
+        if self.whitelist:
+            students = [s for s in students if s["userId"] in self.whitelist]
+        total = len(students)
+        graded = sum(1 for s in students if s.get("already_graded"))
+        return {"total": total, "graded": graded, "ungraded": total - graded}
+
     def fetch_submissions(
         self, grade_book_pk: str, title: str, cache_dir: Path | None = None, verbose: bool = False
     ) -> list[Submission]:

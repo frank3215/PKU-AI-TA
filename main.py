@@ -359,6 +359,69 @@ def submit(
     submit_scores(client, course_id, col_id, records, dry_run=dry_run, encourage=encourage)
 
 
+@app.command(name="list")
+def ls(
+    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
+    whitelist: Annotated[str, typer.Option(help="Comma-separated student IDs to include; empty = all")] = "",
+) -> None:
+    """List all assignments with gradeBookPK and submission/grading counts."""
+    from auth.iaaa import get_session
+    from config import settings
+    from crawler.pku_homework import PKUHomeworkCrawler
+    from rich.table import Table
+
+    course_id = course or settings.course_id
+    if not course_id:
+        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
+        raise typer.Exit(1)
+
+    if whitelist:
+        whitelist_ids: set[str] = {s.strip() for s in whitelist.split(",") if s.strip()}
+    else:
+        student_list_path = Path("student_list")
+        if student_list_path.exists():
+            whitelist_ids = {line.strip() for line in student_list_path.read_text(encoding="utf-8").splitlines() if line.strip()}
+        else:
+            whitelist_ids = settings.whitelist_ids
+
+    console.print("[bold]Authenticating with PKU IAAA…[/bold]")
+    client = get_session()
+
+    console.print(f"[bold]Fetching assignments for {course_id}…[/bold]")
+    crawler = PKUHomeworkCrawler(client, course_id, whitelist_ids)
+    assignments = crawler.fetch_assignments()
+
+    if not assignments:
+        console.print("[yellow]No assignments found.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(title=f"Assignments ({len(assignments)})")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Name", style="cyan")
+    table.add_column("gradeBookPK (--column)", style="green", no_wrap=True)
+    table.add_column("Submitted", justify="right")
+    table.add_column("Graded", justify="right")
+    table.add_column("Ungraded", justify="right")
+
+    for i, a in enumerate(assignments, 1):
+        pk = a.get("gradeBookPK") or a["id"].strip("_").split("_")[0]
+        name = a.get("name", "")
+        try:
+            counts = crawler.count_submissions(pk, name)
+            submitted = f"[cyan]{counts['total']}[/cyan]"
+            graded = f"[green]{counts['graded']}[/green]" if counts["graded"] else "0"
+            ungraded = f"[yellow]{counts['ungraded']}[/yellow]" if counts["ungraded"] else "0"
+        except Exception as e:
+            submitted = "[red]err[/red]"
+            graded = "[red]err[/red]"
+            ungraded = "[red]err[/red]"
+            console.print(f"  [dim red]Error counting {name}: {e}[/dim red]")
+        table.add_row(str(i), name, pk, submitted, graded, ungraded)
+
+    console.print(table)
+    console.print("\nUse [bold]--column <gradeBookPK>[/bold] with [bold]ta grade[/bold] or [bold]ta submit[/bold].")
+
+
 @app.command()
 def review(
     scores: Annotated[Path, typer.Option(help="Excel spreadsheet to review")] = Path("scores.xlsx"),

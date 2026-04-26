@@ -43,7 +43,11 @@ Key variables in `.env`:
 | `PKU_USERNAME` | Your PKU student/staff ID |
 | `PKU_PASSWORD` | Your PKU password |
 | `COURSE_ID` | Blackboard course ID, e.g. `_98024_1` (from the course URL) |
+| `STUDENT_WHITELIST` | Comma-separated student IDs to grade; empty = all students |
 | `REVIEW_THRESHOLD` | Confidence below this → flagged yellow for review (default: `0.75`) |
+| `ENABLE_THINKING` | Enable chain-of-thought / extended thinking mode (default: `false`) |
+| `TA_THREADS` | Number of parallel scoring threads (default: `4`) |
+| `USER_AGENT` | Custom User-Agent for Anthropic API requests (default: empty) |
 
 **3. Prepare your rubric**
 
@@ -74,6 +78,28 @@ Create `rubric.md` describing the scoring criteria. Example:
 ---
 
 ## Usage
+
+### List assignments (find `--column`)
+
+```bash
+# List all assignments with their gradeBookPK and submission stats
+uv run python main.py list
+
+# With a custom course ID
+uv run python main.py list --course _98024_1
+
+# Only count specific students
+uv run python main.py list --whitelist 2300012345,2300012346
+```
+
+Output includes Submitted / Graded / Ungraded counts per assignment.
+If `--whitelist` is omitted, automatically reads IDs from a `student_list` file.
+
+> **Finding `--column` (assignment ID):**
+> Run `ta list` to see all assignments with their gradeBookPKs. The numeric value
+> in the `gradeBookPK` column is what you pass to `--column`.
+
+---
 
 ### Step 1 — Grade
 
@@ -140,7 +166,8 @@ This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence
 > Navigate to any page of your course on course.pku.edu.cn. The URL contains `course_id=_98024_1` — copy that value including the underscores.
 >
 > **Finding `--column` (assignment ID):**
-> Go to the homework list, click **查看** next to any assignment. The URL of the student list page looks like:
+> Run `ta list` to see all assignments and their gradeBookPKs, or manually:
+> go to the homework list, click **查看** next to any assignment. The URL looks like:
 > ```
 > …/getStudentWork.do?course_id=_98024_1&gradeBookPK=423829&title=第一次作业
 > ```
