@@ -13,9 +13,11 @@ student_list
 
 .pytest_cache
 .claude
-scores.xlsx
-rubric.md
-CLAUDE.md
+
+# Data files
+*.xlsx
+rubric*.md
+
 submissions/
 算分*.docx
 .~scores.xlsx
