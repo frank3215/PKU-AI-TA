@@ -39,6 +39,7 @@ class Submission(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
     submitted_at: str = ""  # ISO string from platform
     already_graded: bool = False  # True if the newest attempt is already graded on PKU website
+    has_multiple_attempts: bool = False  # True if student submitted multiple times — always re-download
 
 
 class CriterionScore(BaseModel):
@@ -65,7 +66,9 @@ class ScoringResult(BaseModel):
     uncertain_parts: list[UncertainPart] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     llm_reasoning: str = ""
+    student_feedback: str = ""  # brief student-facing deduction summary, e.g. "扣2分：输出顺序与题目要求相反"
     needs_review: bool = False  # set True when confidence < threshold or uncertain_parts exist
+    processing_notes: str = ""  # e.g. "text", "vision", "text+vision" — how attachments were sent to LLM
 
     @property
     def pct(self) -> float:

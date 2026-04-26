@@ -6,11 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # LLM (OpenAI-compatible)
+    # LLM provider: "openai" (default, OpenAI-compatible) or "anthropic" (native Messages API)
+    llm_provider: str = "openai"
     openai_base_url: str = "https://openrouter.ai/api/v1"
     openai_api_key: str
     ta_model: str = "qwen/qwen3.5-397b-a17b"
-    # Disable chain-of-thought thinking tokens (Qwen3 series); faster + cheaper
+    # Enable extended thinking / chain-of-thought for deeper reasoning.
+    # - OpenAI-compat (Qwen3): passes enable_thinking=true in extra_body
+    # - Anthropic native: enables Claude 3.7+ extended thinking mode
     enable_thinking: bool = False
     # Number of parallel LLM scoring threads
     ta_threads: int = 4

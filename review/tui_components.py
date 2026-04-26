@@ -13,7 +13,7 @@ from typing import Any
 import openpyxl
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -32,7 +32,7 @@ except ImportError:
         pass
 
 
-def prompt_text(prompt_label: str, default: str = "", console: Console | None = None, allow_interrupt: bool = False) -> str:
+def prompt_text(prompt_label: str, default: str = "", console: Console | None = None, allow_interrupt: bool = False, multiline: bool = False) -> str:
     """Prompt for text input using Python's built-in input() for better IME and cursor support.
 
     This is better than rich.prompt.Prompt for:
@@ -41,28 +41,55 @@ def prompt_text(prompt_label: str, default: str = "", console: Console | None = 
     - Proper backspace handling with multi-byte characters
 
     If allow_interrupt is True, KeyboardInterrupt will be raised instead of returning default.
+    If multiline is True, the user can enter multiple lines; an empty line ends input.
     """
     # Print the prompt on its own line first to avoid readline cursor position issues
     if console:
         console.print(f"{prompt_label}", end="")
-        if default:
+        if default and not multiline:
             console.print(f" [dim](default: {default})[/dim]", end="")
-        console.print()
+        if multiline:
+            console.print(" [dim](multi-line, empty line to finish)[/dim]")
+        else:
+            console.print()
     else:
-        print(f"{prompt_label}{f' (default: {default})' if default else ''}")
+        suffix = " (multi-line, empty line to finish)" if multiline else ""
+        default_hint = f" (default: {default})" if default and not multiline else ""
+        print(f"{prompt_label}{default_hint}{suffix}")
 
-    # Then just use a simple "> " prompt for input()
-    try:
-        result = input("> ")
-        return result.strip() if result.strip() != "" else default
-    except EOFError:
-        print()
-        return default
-    except KeyboardInterrupt:
-        print()
-        if allow_interrupt:
-            raise
-        return default
+    if not multiline:
+        try:
+            result = input("> ")
+            return result.strip() if result.strip() != "" else default
+        except EOFError:
+            print()
+            return default
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            return default
+
+    # Multi-line mode: keep reading until empty line
+    lines: list[str] = []
+    if default:
+        print(default)
+
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            break
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or default
 
 
 def prompt_choice(prompt_label: str, choices: list[str], default: str | None = None, console: Console | None = None) -> str:
@@ -73,17 +100,50 @@ def prompt_choice(prompt_label: str, choices: list[str], default: str | None = N
     return Prompt.ask(prompt_label, choices=choices, default=default)
 
 
-def find_submission_file(submissions_dir: Path, student_id: str, student_name: str) -> Path | None:
-    """Find submission file for a student by matching student_id in filename."""
+def find_submission_file(
+    submissions_dir: Path,
+    student_id: str,
+    student_name: str,
+    assignment_id: str | None = None,
+) -> Path | None:
+    """Find submission file for a student by matching student_id in filename.
+
+    If *assignment_id* is provided, only search inside
+    ``submissions_dir / assignment_id``.  Otherwise fall back to all
+    subdirectories (and the top-level directory) and return the most
+    recently modified match.
+    """
     if not submissions_dir.exists():
         return None
+
+    matches: list[Path] = []
+
+    # 1. Prefer exact assignment directory when we know it
+    if assignment_id:
+        exact_dir = submissions_dir / assignment_id
+        if exact_dir.is_dir():
+            for f in exact_dir.iterdir():
+                if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                    return f  # exact hit — no need to search further
+
+    # 2. Fallback: search all subdirectories
     for assignment_dir in submissions_dir.iterdir():
-        if not assignment_dir.is_dir() or assignment_dir.name.startswith(".`"):
+        if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
             continue
         for f in assignment_dir.iterdir():
             if f.is_file() and not f.name.startswith(".") and student_id in f.name:
-                return f
-    return None
+                matches.append(f)
+
+    # 3. Also check the top-level directory itself
+    for f in submissions_dir.iterdir():
+        if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+            matches.append(f)
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
 
 
 def open_file(filepath: Path, console: Console | None = None) -> None:
@@ -167,7 +227,7 @@ def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
         needs_review = row_data.get("needs_review") == "YES"
         already_approved = str(row_data.get("approved", "")).upper() == "YES"
 
-        if total_score >= total_max and not needs_review and not already_approved:
+        if total_score == 100.0 and total_max == 100.0 and not needs_review and not already_approved:
             student_name = row_data.get("student_name", "")
             student_id = row_data.get("student_id", "")
             console.print(f"  [dim]Auto-approving:[/dim] {student_name} ({student_id}) — {total_score}/{total_max}")
@@ -189,6 +249,13 @@ class ReviewSession:
         self.current_idx = 0
         self.modified_rows: dict[int, dict] = {}
         self.modified = False
+
+        # Infer assignment_id from the first row of the spreadsheet so we can
+        # locate the correct submission directory.
+        self.assignment_id: str | None = None
+        if self.rows:
+            _, first_row_data = self.rows[0]
+            self.assignment_id = str(first_row_data.get("assignment_id") or "").strip() or None
 
     def get_current_row(self) -> tuple[int, dict] | None:
         if 0 <= self.current_idx < len(self.rows):
@@ -230,7 +297,7 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
         console.print("\n[yellow]Score is not 100%. Please add reviewer notes.[/yellow]")
         current_notes = str(row_data.get("reviewer_notes") or "")
         try:
-            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True)
+            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
         except KeyboardInterrupt:
             console.print("\n[yellow]Approve cancelled.[/yellow]")
             return False
@@ -241,6 +308,16 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
             console.print("[green]Added reviewer notes.[/green]")
         else:
             console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
+
+    # Ask before clearing reviewer notes for perfect scores
+    if is_perfect and has_notes:
+        console.print(f"\n[dim]Current notes:[/dim] {row_data['reviewer_notes']}")
+        if Confirm.ask("[bold cyan]Clear reviewer notes for this perfect score?[/bold cyan]", default=True):
+            row_data["reviewer_notes"] = ""
+            session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value="")
+            console.print("[dim]Cleared reviewer notes.[/dim]")
+        else:
+            console.print("[dim]Kept reviewer notes.[/dim]")
 
     session.ws.cell(row=row_idx, column=session.idx["approved"] + 1, value="YES")
     row_data["approved"] = "YES"
@@ -253,7 +330,7 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     current_notes = str(row_data.get("reviewer_notes") or "")
     console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
     try:
-        new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True)
+        new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
         return
@@ -316,12 +393,21 @@ def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, floa
             awarded = float(item.get("points_awarded", 0))
             max_p = float(item.get("points_max", 0))
             style = "red" if awarded < max_p else "green"
-            bd_table.add_row(
-                str(i),
-                str(item.get("criterion", "")),
-                Text(f"{awarded}", style=style),
-                f"{max_p}"
-            )
+            # Bold the number for incorrect items so they stand out
+            if awarded < max_p:
+                bd_table.add_row(
+                    Text(str(i), style="bold underline red"),
+                    Text(str(item.get("criterion", "")), style="underline"),
+                    Text(f"{awarded}", style="underline red"),
+                    Text(f"{max_p}", style="underline"),
+                )
+            else:
+                bd_table.add_row(
+                    Text(str(i)),
+                    str(item.get("criterion", "")),
+                    Text(f"{awarded}", style=style),
+                    f"{max_p}",
+                )
         console.print(bd_table)
 
         # Calculate and show current total

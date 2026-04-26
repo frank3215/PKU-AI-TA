@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Annotated, Optional
 from time import time
+import zipfile
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import typer
 from rich.console import Console
@@ -32,7 +36,8 @@ def grade(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
     resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
     regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
-    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_en.md)")] = Path("prompts/system_en.md"),
+    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_zh.md)")] = Path("prompts/system_zh.md"),
+    threads: Annotated[int, typer.Option(help="Parallel scoring threads (default: from .env or 4)")] = 0,
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -51,6 +56,10 @@ def grade(
     from scorer.llm import score_submission
     from models import ScoringResult
 
+    # Override thread count from CLI if explicitly set
+    if threads > 0:
+        settings.ta_threads = threads
+
     # Checkpoint save/load using Excel format
     checkpoint_path = out
     all_results: list[ScoringResult] = []
@@ -66,6 +75,15 @@ def grade(
     def load_checkpoint() -> tuple[list[ScoringResult], set[str]]:
         """Load previous progress from output Excel file (if exists and --resume or --regrade-unapproved is set)."""
         if (resume or regrade_unapproved) and checkpoint_path.exists():
+            # Sanity check: empty or truncated Excel files cannot be loaded
+            if checkpoint_path.stat().st_size < 100:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Checkpoint file {checkpoint_path} is empty ({checkpoint_path.stat().st_size} bytes). "
+                    "A previous run may have been interrupted during save.\n"
+                    f"[dim]Hint: restore from a backup (e.g. scores_副本.xlsx) if available.[/dim]"
+                )
+                return [], set()
+
             try:
                 from review.spreadsheet import load_reviewed
                 records = load_reviewed(checkpoint_path)
@@ -81,6 +99,11 @@ def grade(
                     results = [r.result for r in records]
                     console.print(f"[bold cyan]Resuming from checkpoint:[/bold cyan] {len(results)} previously processed result(s)")
                     return results, {r.student_id for r in results}
+            except zipfile.BadZipFile as e:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Checkpoint file {checkpoint_path} is corrupted ({e}).\n"
+                    f"[dim]Hint: restore from a backup (e.g. scores_副本.xlsx) if available.[/dim]"
+                )
             except Exception as e:
                 console.print(f"[yellow]Warning: Could not load checkpoint: {e}[/yellow]")
         return [], set()
@@ -149,7 +172,7 @@ def grade(
             col_title = col.get("name") or col["id"]
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
-            submissions = crawler.fetch_submissions(grade_book_pk, col_title)
+            submissions = crawler.fetch_submissions(grade_book_pk, col_title, cache_dir=save_dir, verbose=verbose)
             if not submissions:
                 console.print("  No submissions found.")
                 continue
@@ -174,8 +197,12 @@ def grade(
                 console.print(f"  {len(submissions)} submission(s) remaining to process")
 
             if save_dir:
-                _save_submissions(submissions, save_dir, col_title)
-                console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
+                written = _save_submissions(submissions, save_dir, col_title)
+                skipped = len(submissions) - written
+                msg = f"  Saved files → [cyan]{save_dir / col_title}[/cyan]"
+                if skipped:
+                    msg += f" ([dim]{skipped} already cached[/dim])"
+                console.print(msg)
 
             total_submissions = len(submissions)
             console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, prompt={prompt.name})…")
@@ -189,12 +216,14 @@ def grade(
                 TaskProgressColumn(),
                 TimeElapsedColumn(),
                 TextColumn("[dim]ETA: {task.fields[eta]}"),
+                TextColumn("[dim]Last: {task.fields[last]}"),
                 console=console, transient=not verbose,
             ) as progress:
-                task = progress.add_task("  Scoring", total=total_submissions, eta="calculating...")
+                task = progress.add_task("  Scoring", total=total_submissions, eta="calculating...", last="—")
                 completed_count = 0
 
-                with ThreadPoolExecutor(max_workers=settings.ta_threads) as executor:
+                executor = ThreadPoolExecutor(max_workers=settings.ta_threads)
+                try:
                     futures = {executor.submit(score_submission, sub, rubric_text, prompt): sub for sub in submissions}
                     for future in as_completed(futures):
                         sub = futures[future]
@@ -219,6 +248,16 @@ def grade(
                             else:
                                 progress.update(task, eta="...")
 
+                            # Show last-completed result inline (works even in parallel mode)
+                            last_status = "[yellow]REVIEW[/yellow]" if result.needs_review else "[green]OK[/green]"
+                            last_extra = ""
+                            if result.uncertain_parts:
+                                last_extra = f" [yellow]⚠{len(result.uncertain_parts)}[/yellow]"
+                            progress.update(
+                                task,
+                                last=f"{result.student_id} {result.total_score:.0f}/{result.total_max:.0f} {last_status}{last_extra}",
+                            )
+
                             # Save checkpoint after each result for safety
                             save_checkpoint()
 
@@ -227,15 +266,34 @@ def grade(
                                 needs_review = result.needs_review
                                 color = "yellow" if needs_review else "green"
                                 status = "NEEDS_REVIEW" if needs_review else "OK"
+                                mode_color = "cyan" if result.processing_notes == "text" else "magenta"
                                 console.print(
                                     f"  [{color}]{result.student_id:12s}[/] {result.student_name:10s} "
                                     f"→ {result.total_score:3.0f}/{result.total_max:3.0f} ({result.pct:3.0f}%) "
-                                    f"[{color}]{status}[/]"
+                                    f"[{color}]{status}[/] [{mode_color}]{result.processing_notes}[/]"
                                 )
+                                # Show uncertain parts inline so rubric issues are visible immediately
+                                for up in result.uncertain_parts:
+                                    # Show full description in verbose mode
+                                    desc = up.description.strip()
+                                    console.print(f"    [dim yellow]⚠ {desc}[/]")
+                                # Show deductions inline so the user sees why points were lost
+                                for b in result.breakdown:
+                                    if b.points_awarded < b.points_max:
+                                        console.print(f"    [dim red]− {b.criterion} ({b.points_awarded:.0f}/{b.points_max:.0f}): {b.reasoning.strip()}[/]")
+                                # Show student-facing feedback (reviewer_notes) for non-perfect scores
+                                if result.student_feedback:
+                                    console.print(f"    [dim cyan]→ Feedback: {result.student_feedback}[/]")
                         except Exception as e:
                             console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
+                            if verbose and hasattr(e, 'raw_response'):
+                                console.print(f"  [dim red]--- Full raw response ---[/]")
+                                console.print(f"[dim]{e.raw_response}[/]")
+                                console.print(f"  [dim red]--- End raw response ---[/]")
                         finally:
                             progress.advance(task)
+                finally:
+                    executor.shutdown(wait=False)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
@@ -268,6 +326,7 @@ def submit(
     column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
     scores: Annotated[Path, typer.Option(help="Reviewed Excel spreadsheet")] = Path("scores.xlsx"),
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Print what would be submitted without posting")] = False,
+    encourage: Annotated[Optional[str], typer.Option("--encourage", "-e", help="Message to attach to perfect scores that have no reviewer notes")] = None,
 ) -> None:
     """Submit approved scores from the reviewed spreadsheet back to course.pku.edu.cn."""
     from auth.iaaa import get_session
@@ -297,7 +356,7 @@ def submit(
     console.print("[bold]Authenticating with PKU IAAA…[/bold]")
     client = get_session()
 
-    submit_scores(client, course_id, col_id, records, dry_run=dry_run)
+    submit_scores(client, course_id, col_id, records, dry_run=dry_run, encourage=encourage)
 
 
 @app.command()
@@ -340,19 +399,28 @@ def review(
         raise typer.Exit(1)
 
 
-def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> None:
-    """Save each student's attachment file to save_dir/assignment_title/ for human review."""
+def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> int:
+    """Save each student's attachment file to save_dir/assignment_title/ for human review.
+
+    Returns the number of files actually written (skips those already present).
+    """
     import re
     safe_title = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', assignment_title)
     dest = save_dir / safe_title
     dest.mkdir(parents=True, exist_ok=True)
+    written = 0
     for sub in submissions:
         for att in sub.attachments:
             ext = Path(att.filename).suffix or ""
             # Filename: studentId_studentName.ext  (e.g. 2300012345_张三.pdf)
             safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', sub.student_name)
             filename = f"{sub.student_id}_{safe_name}{ext}"
-            (dest / filename).write_bytes(att.data)
+            target = dest / filename
+            if target.exists() and not sub.has_multiple_attempts:
+                continue
+            target.write_bytes(att.data)
+            written += 1
+    return written
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-LLM-based scorer using OpenAI-compatible API (OpenRouter → Qwen).
+LLM-based scorer supporting both OpenAI-compatible and Anthropic-native APIs.
 
 Scoring pipeline per submission:
   1. Try to extract text from the attachment (pypdf for PDFs, python-docx for Word).
@@ -13,17 +13,15 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import re
+import time
 from pathlib import Path
-
-from openai import OpenAI
 
 from config import settings
 from models import Attachment, CriterionScore, ScoringResult, Submission, UncertainPart
 
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-
-_client: OpenAI | None = None
 
 _UNREADABLE_MARKERS = (
     "no extractable text",
@@ -35,18 +33,48 @@ _UNREADABLE_MARKERS = (
     "Unknown file format",
 )
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(
+logger = logging.getLogger("pku_ai_ta.scorer")
+
+# ---------------------------------------------------------------------------
+# Client initialization
+# ---------------------------------------------------------------------------
+
+_openai_client = None
+_anthropic_client = None
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(
             base_url=settings.openai_base_url,
             api_key=settings.openai_api_key,
         )
-    return _client
+    return _openai_client
 
 
-_DEFAULT_PROMPT = _PROMPTS_DIR / "system_en.md"
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        from anthropic import Anthropic
+        kwargs = {
+            "api_key": settings.openai_api_key,
+            # Override the default User-Agent to avoid vendor blocking
+            "default_headers": {"User-Agent": "claude-cli/2.1.81 (external, cli)"},
+        }
+        # If a custom base_url is set (not the OpenAI-compat defaults), pass it through.
+        if settings.openai_base_url and "openrouter" not in settings.openai_base_url:
+            kwargs["base_url"] = settings.openai_base_url
+        _anthropic_client = Anthropic(**kwargs)
+    return _anthropic_client
+
+
+_DEFAULT_PROMPT = _PROMPTS_DIR / "system_zh.md"
 
 
 def get_system_prompt(path: Path) -> str:
@@ -109,6 +137,40 @@ def _pdf_has_embedded_images(data: bytes) -> bool:
         return False
 
 
+def _text_looks_garbled(text: str) -> bool:
+    """Detect if extracted text looks like garbled OCR from handwriting."""
+    import re
+    import unicodedata
+
+    if len(text) < 100:
+        return False
+
+    # Signal 1: High ratio of control / non-printable characters
+    control_count = sum(
+        1 for c in text
+        if unicodedata.category(c).startswith('C') and c not in '\t\n\r'
+    )
+    if control_count > len(text) * 0.01:
+        return True
+
+    # Signal 2: 3+ letter Latin sequences with no vowels (OCR garbage like "ftityi")
+    # y/Y counts as vowel to avoid false positives (fly, python, etc.)
+    vowels = set('aeiouyAEIOUY')
+    garbage_count = 0
+    for match in re.finditer(r'[a-zA-Z]{3,}', text):
+        seq = match.group()
+        if not any(c in vowels for c in seq):
+            garbage_count += 1
+    if garbage_count >= 3:  # 3+ such sequences = likely garbled OCR
+        return True
+
+    # Signal 3: Replacement characters indicating encoding failure
+    if text.count('�') > len(text) * 0.005:
+        return True
+
+    return False
+
+
 def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     if any(marker in text for marker in _UNREADABLE_MARKERS):
         return True
@@ -118,17 +180,28 @@ def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
         if _pdf_has_embedded_images(attachment.data):
             return True
 
+    stripped = text.strip()
     # Very short extracted text almost certainly means watermarks only, not real content
-    return len(text.strip()) < 200
+    if len(stripped) < 200:
+        return True
+
+    # Detect garbled OCR text: PDF text layer exists but is unreadable.
+    # For Chinese homework, a long text with almost no CJK characters is
+    # a strong signal of corrupted OCR / bad text extraction.
+    cjk_count = sum(1 for ch in stripped if '\u4e00' <= ch <= '\u9fff')
+    if len(stripped) > 200 and cjk_count / len(stripped) < 0.02:
+        return True
+
+    # NEW: Detect text that looks like bad OCR from handwritten PDFs
+    # (e.g. vector pen strokes not detected as images by _pdf_has_embedded_images)
+    if _text_looks_garbled(stripped):
+        return True
+
+    return False
 
 
 def _pdf_to_image_parts(data: bytes) -> list[dict]:
-    """Render PDF pages to images for vision model.
-
-    Always renders pages directly rather than trying to extract embedded images,
-    because PDFs often contain non-content images (ICC profiles, thumbnails, etc.)
-    that aren't student work. Rendering ensures we see exactly what a human sees.
-    """
+    """Render PDF pages to images for vision model."""
     import fitz  # pymupdf
     doc = fitz.open(stream=data, filetype="pdf")
     parts = []
@@ -144,12 +217,7 @@ def _pdf_to_image_parts(data: bytes) -> list[dict]:
 
 
 def _attachment_content_parts(attachment: Attachment) -> list[dict]:
-    """
-    Return content parts for one attachment.
-
-    Tries text extraction first. For scanned/image files falls back to sending
-    the raw image bytes as image_url so the model can read them visually.
-    """
+    """Return content parts for one attachment in OpenAI format."""
     text = _extract_text(attachment)
     if not _needs_vision(text, attachment):
         return [{"type": "text", "text": f"**File: {attachment.filename}**\n\n{text}"}]
@@ -190,17 +258,95 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic format conversion
+# ---------------------------------------------------------------------------
+
+def _to_anthropic_content(parts: list[dict]) -> list[dict]:
+    """Convert OpenAI-format content parts to Anthropic Messages API format."""
+    result = []
+    for part in parts:
+        if part.get("type") == "text":
+            result.append({"type": "text", "text": part["text"]})
+        elif part.get("type") == "image_url":
+            url = part["image_url"]["url"]
+            # Parse data URI: data:image/png;base64,...
+            if url.startswith("data:"):
+                header, _, b64 = url.partition(",")
+                media_type = header.split(";")[0].replace("data:image/", "image/")
+                result.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64,
+                    },
+                })
+            else:
+                # External URL — Anthropic doesn't support this directly, skip
+                result.append({"type": "text", "text": f"[image: {url}]"})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LLM call helpers
+# ---------------------------------------------------------------------------
+
+def _call_openai(system_prompt: str, content_parts: list[dict]) -> str:
+    """Call OpenAI-compatible API and return raw text response."""
+    client = _get_openai_client()
+    extra: dict = {}
+    if not settings.enable_thinking:
+        model_name = settings.ta_model.lower()
+        if "qwen" in model_name and ("openrouter" in settings.openai_base_url or "dashscope" in settings.openai_base_url):
+            extra["extra_body"] = {"enable_thinking": False}
+
+    response = client.chat.completions.create(
+        model=settings.ta_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content_parts},
+        ],
+        temperature=0.2,
+        **extra,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _call_anthropic(system_prompt: str, content_parts: list[dict]) -> str:
+    """Call Anthropic Messages API and return raw text response."""
+    client = _get_anthropic_client()
+    ac = _to_anthropic_content(content_parts)
+    kwargs: dict = {
+        "model": settings.ta_model,
+        "max_tokens": 16384,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": ac}],
+    }
+    if settings.enable_thinking:
+        # Anthropic extended thinking mode (Claude 3.7+)
+        # Note: thinking mode requires temperature=1
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+        kwargs["temperature"] = 1.0
+    else:
+        kwargs["temperature"] = 0.2
+    response = client.messages.create(**kwargs)
+    # Anthropic returns content blocks; collect text blocks (skipping thinking blocks)
+    text_parts: list[str] = []
+    for block in response.content:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_parts.append(block.text)
+        elif block_type == "thinking" and settings.enable_thinking:
+            logger.debug("Anthropic thinking: %s", getattr(block, "thinking", "")[:500])
+    return "\n".join(text_parts)
+
+
+# ---------------------------------------------------------------------------
 # Main scoring function
 # ---------------------------------------------------------------------------
 
 def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAULT_PROMPT) -> ScoringResult:
-    """Score a single submission against the rubric using the LLM.
-
-    Args:
-        submission: The student submission to score.
-        rubric: The rubric text.
-        prompt: Path to the system prompt file. Defaults to prompts/system_en.md.
-    """
+    """Score a single submission against the rubric using the LLM."""
     system_prompt = get_system_prompt(prompt)
 
     content: list[dict] = [
@@ -210,28 +356,28 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
     if submission.text_content.strip():
         content.append({"type": "text", "text": f"**Text answer:**\n{submission.text_content}"})
 
+    # Track how each attachment was processed (text vs vision) for debugging
+    _processing_modes: list[str] = []
     for att in submission.attachments:
-        content.extend(_attachment_content_parts(att))
+        parts = _attachment_content_parts(att)
+        mode = "vision" if any(p.get("type") == "image_url" for p in parts) else "text"
+        _processing_modes.append(mode)
+        content.extend(parts)
 
-    extra: dict = {}
-    if not settings.enable_thinking:
-        # Only send enable_thinking for Qwen models on platforms that support it
-        # Skip for Volcengine/other providers that don't support this parameter
-        model_name = settings.ta_model.lower()
-        if "qwen" in model_name and ("openrouter" in settings.openai_base_url or "dashscope" in settings.openai_base_url):
-            extra["extra_body"] = {"enable_thinking": False}
-
-    response = _get_client().chat.completions.create(
-        model=settings.ta_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ],
-        temperature=0.2,
-        **extra,
+    processing_notes = (
+        "+".join(_processing_modes)
+        if len(set(_processing_modes)) > 1
+        else (_processing_modes[0] if _processing_modes else "text")
     )
 
-    raw = response.choices[0].message.content or ""
+    start = time.time()
+    provider = settings.llm_provider.lower()
+    if provider == "anthropic":
+        raw = _call_anthropic(system_prompt, content)
+    else:
+        raw = _call_openai(system_prompt, content)
+    elapsed = time.time() - start
+
     data = _parse_json(raw)
 
     def _f(val, default: float = 0.0) -> float:
@@ -256,19 +402,59 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
     ]
     confidence = _f(data.get("confidence"), 1.0)
 
-    return ScoringResult(
+    # Override LLM-returned totals with the sum of breakdown to ensure consistency
+    llm_total_score = _f(data.get("total_score"))
+    llm_total_max = _f(data.get("total_max"))
+    if breakdown:
+        computed_score = sum(b.points_awarded for b in breakdown)
+        computed_max = sum(b.points_max for b in breakdown)
+        if computed_score != llm_total_score or computed_max != llm_total_max:
+            logger.warning(
+                "Correcting inconsistent totals for %s %s: "
+                "LLM returned %.1f/%.1f but breakdown sums to %.1f/%.1f",
+                submission.student_id,
+                submission.student_name,
+                llm_total_score,
+                llm_total_max,
+                computed_score,
+                computed_max,
+            )
+        total_score = computed_score
+        total_max = computed_max
+    else:
+        total_score = llm_total_score
+        total_max = llm_total_max
+
+    result = ScoringResult(
         student_id=submission.student_id,
         student_name=submission.student_name,
         bb_user_id=submission.bb_user_id,
         assignment_id=submission.assignment_id,
-        total_score=_f(data.get("total_score")),
-        total_max=_f(data.get("total_max")),
+        total_score=total_score,
+        total_max=total_max,
         breakdown=breakdown,
         uncertain_parts=uncertain,
         confidence=confidence,
         llm_reasoning=data.get("llm_reasoning", ""),
-        needs_review=confidence < settings.review_threshold or len(uncertain) > 0,
+        student_feedback=data.get("student_feedback", ""),
+        needs_review=(confidence < settings.review_threshold or len(uncertain) > 0 or total_score < total_max),
+        processing_notes=processing_notes,
     )
+
+    logger.info(
+        "Scored %s %s: %.1f/%.1f (conf=%.2f, mode=%s) via %s/%s in %.2fs",
+        result.student_id,
+        result.student_name,
+        result.total_score,
+        result.total_max,
+        result.confidence,
+        result.processing_notes,
+        provider,
+        settings.ta_model,
+        elapsed,
+    )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -280,20 +466,63 @@ def _sanitize_json(s: str) -> str:
     return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
 
 
+def _fix_string_newlines(s: str) -> str:
+    """Replace raw newlines inside JSON double-quoted strings with escaped \\n."""
+    result: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if escape:
+            result.append(ch)
+            escape = False
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string and ch in '\n\r':
+            result.append('\\n')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
 def _parse_json(raw: str) -> dict:
     """Extract JSON from model output, tolerating minor formatting issues."""
-    cleaned = re.sub(r"```(?:json)?\s*|```", "", raw).strip()
-    for candidate in [cleaned, _sanitize_json(cleaned)]:
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Try progressively more aggressive fixes
+    fixes = [
+        lambda x: x,                                    # raw
+        _fix_string_newlines,                           # fix newlines in strings
+        _sanitize_json,                                 # fix stray backslashes
+        lambda x: _sanitize_json(_fix_string_newlines(x)),  # both
+    ]
+    for fix in fixes:
+        candidate = fix(cleaned)
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
             pass
+
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         block = match.group()
-        for candidate in [block, _sanitize_json(block)]:
+        for fix in fixes:
+            candidate = fix(block)
             try:
                 return json.loads(candidate)
             except json.JSONDecodeError:
                 pass
-    raise ValueError(f"Could not parse LLM response as JSON:\n{raw[:500]}")
+    # Log full raw response for debugging (no truncation)
+    logger.error("Could not parse LLM response as JSON. Full raw response:\n%s", raw)
+    exc = ValueError(f"Could not parse LLM response as JSON. Full raw response:\n{raw}")
+    exc.raw_response = raw  # Attach full response for verbose debug output
+    raise exc

@@ -41,8 +41,9 @@ COLUMNS = [
 
 
 def export(results: list[ScoringResult], path: Path) -> None:
-    """Write scoring results to an Excel file."""
+    """Write scoring results to an Excel file atomically (via a temp file)."""
     import json
+    import os
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -71,7 +72,7 @@ def export(results: list[ScoringResult], path: Path) -> None:
             json.dumps([u.model_dump() for u in r.uncertain_parts], ensure_ascii=False),
             r.llm_reasoning,
             "",   # reviewer_override_score
-            "",   # reviewer_notes
+            r.student_feedback,   # reviewer_notes — pre-filled with LLM feedback for students
             "NO", # approved — reviewer changes to YES
         ]
         for col, value in enumerate(row_data, start=1):
@@ -87,7 +88,32 @@ def export(results: list[ScoringResult], path: Path) -> None:
         max_len = max((len(str(c.value or "")) for c in col), default=10)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
 
-    wb.save(path)
+    # Atomic write: save to temp file, then rename. Prevents corruption if
+    # the process is killed mid-write.
+    tmp = path.with_suffix(".xlsx.tmp")
+    wb.save(tmp)
+    os.replace(tmp, path)
+
+
+def _safe_json_loads(raw: str | None, label: str, student_id: str) -> list:
+    """Parse JSON with fallback sanitization for malformed escapes."""
+    import json
+    import re
+
+    text = raw or "[]"
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Fix: stray \u not followed by 4 hex digits (e.g. LaTeX \underbrace)
+        fixed = re.sub(r'\\u(?!([0-9a-fA-F]{4}|\{))', r'\\\\u', text)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            import logging
+            logging.getLogger("pku_ai_ta.spreadsheet").warning(
+                "Could not parse %s for student %s: %s", label, student_id, e
+            )
+            return []
 
 
 def load_reviewed(path: Path) -> list[ReviewRecord]:
@@ -107,8 +133,9 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
         if not row[idx["student_id"]]:
             continue
 
-        breakdown = [CriterionScore(**b) for b in json.loads(row[idx["breakdown_json"]] or "[]")]
-        uncertain = [UncertainPart(**u) for u in json.loads(row[idx["uncertain_parts_json"]] or "[]")]
+        sid = str(row[idx["student_id"]])
+        breakdown = [CriterionScore(**b) for b in _safe_json_loads(row[idx["breakdown_json"]], "breakdown_json", sid)]
+        uncertain = [UncertainPart(**u) for u in _safe_json_loads(row[idx["uncertain_parts_json"]], "uncertain_parts_json", sid)]
 
         result = ScoringResult(
             student_id=str(row[idx["student_id"]]),
@@ -122,6 +149,7 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
             breakdown=breakdown,
             uncertain_parts=uncertain,
             llm_reasoning=str(row[idx["llm_reasoning"]] or ""),
+            student_feedback=str(row[idx["reviewer_notes"]] or ""),
         )
 
         override_raw = row[idx["reviewer_override_score"]]
