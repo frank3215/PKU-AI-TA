@@ -200,7 +200,7 @@ def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
         needs_review = row_data.get("needs_review") == "YES"
         already_approved = str(row_data.get("approved", "")).upper() == "YES"
 
-        if total_score >= total_max and not needs_review and not already_approved:
+        if total_score == 100.0 and total_max == 100.0 and not needs_review and not already_approved:
             student_name = row_data.get("student_name", "")
             student_id = row_data.get("student_id", "")
             console.print(f"  [dim]Auto-approving:[/dim] {student_name} ({student_id}) — {total_score}/{total_max}")

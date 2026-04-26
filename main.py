@@ -36,7 +36,8 @@ def grade(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
     resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
     regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
-    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_en.md)")] = Path("prompts/system_en.md"),
+    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_zh.md)")] = Path("prompts/system_zh.md"),
+    threads: Annotated[int, typer.Option(help="Parallel scoring threads (default: from .env or 4)")] = 0,
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -54,6 +55,10 @@ def grade(
     from review.spreadsheet import export
     from scorer.llm import score_submission
     from models import ScoringResult
+
+    # Override thread count from CLI if explicitly set
+    if threads > 0:
+        settings.ta_threads = threads
 
     # Checkpoint save/load using Excel format
     checkpoint_path = out
@@ -167,7 +172,7 @@ def grade(
             col_title = col.get("name") or col["id"]
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
-            submissions = crawler.fetch_submissions(grade_book_pk, col_title, cache_dir=save_dir)
+            submissions = crawler.fetch_submissions(grade_book_pk, col_title, cache_dir=save_dir, verbose=verbose)
             if not submissions:
                 console.print("  No submissions found.")
                 continue
@@ -211,12 +216,14 @@ def grade(
                 TaskProgressColumn(),
                 TimeElapsedColumn(),
                 TextColumn("[dim]ETA: {task.fields[eta]}"),
+                TextColumn("[dim]Last: {task.fields[last]}"),
                 console=console, transient=not verbose,
             ) as progress:
-                task = progress.add_task("  Scoring", total=total_submissions, eta="calculating...")
+                task = progress.add_task("  Scoring", total=total_submissions, eta="calculating...", last="—")
                 completed_count = 0
 
-                with ThreadPoolExecutor(max_workers=settings.ta_threads) as executor:
+                executor = ThreadPoolExecutor(max_workers=settings.ta_threads)
+                try:
                     futures = {executor.submit(score_submission, sub, rubric_text, prompt): sub for sub in submissions}
                     for future in as_completed(futures):
                         sub = futures[future]
@@ -241,6 +248,16 @@ def grade(
                             else:
                                 progress.update(task, eta="...")
 
+                            # Show last-completed result inline (works even in parallel mode)
+                            last_status = "[yellow]REVIEW[/yellow]" if result.needs_review else "[green]OK[/green]"
+                            last_extra = ""
+                            if result.uncertain_parts:
+                                last_extra = f" [yellow]⚠{len(result.uncertain_parts)}[/yellow]"
+                            progress.update(
+                                task,
+                                last=f"{result.student_id} {result.total_score:.0f}/{result.total_max:.0f} {last_status}{last_extra}",
+                            )
+
                             # Save checkpoint after each result for safety
                             save_checkpoint()
 
@@ -249,15 +266,23 @@ def grade(
                                 needs_review = result.needs_review
                                 color = "yellow" if needs_review else "green"
                                 status = "NEEDS_REVIEW" if needs_review else "OK"
+                                mode_color = "cyan" if result.processing_notes == "text" else "magenta"
                                 console.print(
                                     f"  [{color}]{result.student_id:12s}[/] {result.student_name:10s} "
                                     f"→ {result.total_score:3.0f}/{result.total_max:3.0f} ({result.pct:3.0f}%) "
-                                    f"[{color}]{status}[/]"
+                                    f"[{color}]{status}[/] [{mode_color}]{result.processing_notes}[/]"
                                 )
+                                # Show uncertain parts inline so rubric issues are visible immediately
+                                for up in result.uncertain_parts:
+                                    # Show full description in verbose mode
+                                    desc = up.description.strip()
+                                    console.print(f"    [dim yellow]⚠ {desc}[/]")
                         except Exception as e:
                             console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
                         finally:
                             progress.advance(task)
+                finally:
+                    executor.shutdown(wait=False)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")

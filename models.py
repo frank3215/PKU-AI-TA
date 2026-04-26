@@ -66,6 +66,7 @@ class ScoringResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     llm_reasoning: str = ""
     needs_review: bool = False  # set True when confidence < threshold or uncertain_parts exist
+    processing_notes: str = ""  # e.g. "text", "vision", "text+vision" — how attachments were sent to LLM
 
     @property
     def pct(self) -> float:

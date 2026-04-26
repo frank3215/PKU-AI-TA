@@ -10,7 +10,7 @@ Automatically grades student homework submissions from [course.pku.edu.cn](https
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) package manager
-- An [OpenRouter](https://openrouter.ai) API key (or any OpenAI-compatible endpoint)
+- An LLM API key (OpenAI-compatible or Anthropic-native endpoint)
 - PKU IAAA credentials (student/staff ID + password)
 
 ---
@@ -36,7 +36,8 @@ Key variables in `.env`:
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | Your OpenRouter API key |
+| `LLM_PROVIDER` | `openai` (OpenAI-compatible) or `anthropic` (native Messages API) |
+| `OPENAI_API_KEY` | Your API key |
 | `OPENAI_BASE_URL` | API endpoint (default: `https://openrouter.ai/api/v1`) |
 | `TA_MODEL` | Model to use, e.g. `qwen/qwen3.5-397b-a17b` |
 | `PKU_USERNAME` | Your PKU student/staff ID |
@@ -94,9 +95,9 @@ uv run python main.py grade \
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
   --save-dir ./hw1_submissions
 
-# Use the Chinese system prompt
+# Use the English system prompt
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
-  --prompt prompts/system_zh.md
+  --prompt prompts/system_en.md
 
 # Interrupt with Ctrl-C and resume later
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md --resume
@@ -104,6 +105,10 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 # Keep already-approved students, regrade the rest
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
   --regrade-unapproved
+
+# Control parallel scoring threads (default is 4; use 1 to disable parallelism)
+uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md \
+  --threads 2
 ```
 
 | Flag | Description |
@@ -114,10 +119,20 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 | `--whitelist` | Comma-separated student IDs to grade; omit to grade everyone |
 | `--out` | Output Excel file (default: `scores.xlsx`) |
 | `--save-dir` | Directory to save submission files for human review (default: `submissions/`) |
-| `--prompt` | System prompt file for the LLM (default: `prompts/system_en.md`) |
+| `--prompt` | System prompt file for the LLM (default: `prompts/system_zh.md`) |
 | `--verbose` / `-v` | Print each student's result as it's scored |
 | `--resume` / `-r` | Resume a previously interrupted run |
 | `--regrade-unapproved` | Keep approved students, regrade the rest |
+| `--threads` | Number of parallel scoring threads (default: from `.env` or 4) |
+
+> **Using Anthropic-compatible endpoint:**
+> ```bash
+> # .env
+> LLM_PROVIDER=anthropic
+> OPENAI_BASE_URL=https://your-provider.com/v1
+> OPENAI_API_KEY=sk-xxx
+> TA_MODEL=your-model-name
+> ```
 
 This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence and need manual review.
 
@@ -205,13 +220,13 @@ Built-in prompts live in `prompts/`:
 
 | File | Language |
 |---|---|
-| `prompts/system_en.md` | English (default) |
-| `prompts/system_zh.md` | Chinese |
+| `prompts/system_zh.md` | Chinese (default) |
+| `prompts/system_en.md` | English |
 
 Pass any prompt file to `--prompt`:
 
 ```bash
-uv run python main.py grade ... --prompt prompts/system_zh.md
+uv run python main.py grade ... --prompt prompts/system_en.md
 uv run python main.py grade ... --prompt my_custom_prompt.md
 ```
 

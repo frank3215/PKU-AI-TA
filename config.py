@@ -6,7 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # LLM (OpenAI-compatible)
+    # LLM provider: "openai" (default, OpenAI-compatible) or "anthropic" (native Messages API)
+    llm_provider: str = "openai"
     openai_base_url: str = "https://openrouter.ai/api/v1"
     openai_api_key: str
     ta_model: str = "qwen/qwen3.5-397b-a17b"

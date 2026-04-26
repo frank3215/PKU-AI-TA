@@ -80,7 +80,7 @@ class PKUHomeworkCrawler:
         return _parse_homework_list(resp.text)
 
     def fetch_submissions(
-        self, grade_book_pk: str, title: str, cache_dir: Path | None = None
+        self, grade_book_pk: str, title: str, cache_dir: Path | None = None, verbose: bool = False
     ) -> list[Submission]:
         """
         Fetch student submissions for one assignment.
@@ -114,9 +114,9 @@ class PKUHomeworkCrawler:
             return []
 
         if self.whitelist:
-            return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir)
+            return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
         else:
-            return self._fetch_batch_zip(students, grade_book_pk, title, cache_dir=cache_dir)
+            return self._fetch_batch_zip(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
 
     # ------------------------------------------------------------------
     # Fetching strategies
@@ -124,7 +124,7 @@ class PKUHomeworkCrawler:
 
     def _fetch_per_student(
         self, students: list[dict], grade_book_pk: str, title: str,
-        cache_dir: Path | None = None,
+        cache_dir: Path | None = None, verbose: bool = False,
     ) -> list[Submission]:
         """Download individual files via CheckWork.do + api/pdf.do.
 
@@ -155,15 +155,27 @@ class PKUHomeworkCrawler:
 
             # Cache miss → download from PKU
             if file_bytes is None:
-                file_bytes, filename, content_type = self._download_student_file(
-                    grade_book_pk=grade_book_pk,
-                    title=title,
-                    user_id=student_id,
-                    file_pk=student["filePk"],
-                    attempt_pk=student["attemptPk"],
-                )
-                if file_bytes is None:
+                if verbose:
+                    print(f"  → Downloading {student_id} {student['name']}...")
+                try:
+                    file_bytes, filename, content_type = self._download_student_file(
+                        grade_book_pk=grade_book_pk,
+                        title=title,
+                        user_id=student_id,
+                        file_pk=student["filePk"],
+                        attempt_pk=student["attemptPk"],
+                    )
+                except Exception as e:
+                    if verbose:
+                        print(f"  ✗ Download failed {student_id} {student['name']}: {e}")
                     continue
+                if file_bytes is None:
+                    if verbose:
+                        print(f"  ! No file found {student_id} {student['name']}")
+                    continue
+                if verbose:
+                    size_kb = len(file_bytes) / 1024
+                    print(f"  ✓ Downloaded {student_id} {student['name']} — {filename} ({size_kb:.0f} KB)")
 
             submissions.append(Submission(
                 student_id=student_id,
@@ -179,7 +191,7 @@ class PKUHomeworkCrawler:
 
     def _fetch_batch_zip(
         self, students: list[dict], grade_book_pk: str, title: str,
-        cache_dir: Path | None = None,
+        cache_dir: Path | None = None, verbose: bool = False,
     ) -> list[Submission]:
         """Download all files at once via downloadBatch.do ZIP.
 
@@ -188,12 +200,19 @@ class PKUHomeworkCrawler:
         try:
             zip_resp = self.client.get(
                 f"{HW_BASE}/downloadBatch.do",
-                params={"course_id": self.course_id, "gradeBookPK": grade_book_pk, "isGroup": "false"},
+                params={
+                    "course_id": self.course_id,
+                    "gradeBookPK": grade_book_pk,
+                    "title": quote(title, safe=""),
+                    "isGroup": "false",
+                },
             )
             # Generic status check — works with both requests and httpx clients
             status = getattr(zip_resp, "status_code", getattr(zip_resp, "status", 0))
             if status != 200:
-                raise RuntimeError(f"Batch download returned HTTP {status}")
+                # Log the actual URL for debugging
+                actual_url = getattr(zip_resp, "url", "unknown")
+                raise RuntimeError(f"Batch download returned HTTP {status} (URL: {actual_url})")
 
             with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
                 zip_files = [(name, zf.read(name)) for name in zf.namelist()]
@@ -224,7 +243,7 @@ class PKUHomeworkCrawler:
             original_whitelist = self.whitelist
             self.whitelist = {s["userId"] for s in students}
             try:
-                return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir)
+                return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
             finally:
                 self.whitelist = original_whitelist
 
