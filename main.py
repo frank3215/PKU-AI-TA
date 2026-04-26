@@ -326,6 +326,7 @@ def submit(
     column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
     scores: Annotated[Path, typer.Option(help="Reviewed Excel spreadsheet")] = Path("scores.xlsx"),
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Print what would be submitted without posting")] = False,
+    encourage: Annotated[Optional[str], typer.Option("--encourage", "-e", help="Message to attach to perfect scores that have no reviewer notes")] = None,
 ) -> None:
     """Submit approved scores from the reviewed spreadsheet back to course.pku.edu.cn."""
     from auth.iaaa import get_session
@@ -355,7 +356,7 @@ def submit(
     console.print("[bold]Authenticating with PKU IAAA…[/bold]")
     client = get_session()
 
-    submit_scores(client, course_id, col_id, records, dry_run=dry_run)
+    submit_scores(client, course_id, col_id, records, dry_run=dry_run, encourage=encourage)
 
 
 @app.command()

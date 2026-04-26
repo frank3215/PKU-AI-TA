@@ -95,6 +95,27 @@ def export(results: list[ScoringResult], path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _safe_json_loads(raw: str | None, label: str, student_id: str) -> list:
+    """Parse JSON with fallback sanitization for malformed escapes."""
+    import json
+    import re
+
+    text = raw or "[]"
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Fix: stray \u not followed by 4 hex digits (e.g. LaTeX \underbrace)
+        fixed = re.sub(r'\\u(?!([0-9a-fA-F]{4}|\{))', r'\\\\u', text)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            import logging
+            logging.getLogger("pku_ai_ta.spreadsheet").warning(
+                "Could not parse %s for student %s: %s", label, student_id, e
+            )
+            return []
+
+
 def load_reviewed(path: Path) -> list[ReviewRecord]:
     """Read a reviewed spreadsheet back into ReviewRecord objects."""
     import json
@@ -112,8 +133,9 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
         if not row[idx["student_id"]]:
             continue
 
-        breakdown = [CriterionScore(**b) for b in json.loads(row[idx["breakdown_json"]] or "[]")]
-        uncertain = [UncertainPart(**u) for u in json.loads(row[idx["uncertain_parts_json"]] or "[]")]
+        sid = str(row[idx["student_id"]])
+        breakdown = [CriterionScore(**b) for b in _safe_json_loads(row[idx["breakdown_json"]], "breakdown_json", sid)]
+        uncertain = [UncertainPart(**u) for u in _safe_json_loads(row[idx["uncertain_parts_json"]], "uncertain_parts_json", sid)]
 
         result = ScoringResult(
             student_id=str(row[idx["student_id"]]),

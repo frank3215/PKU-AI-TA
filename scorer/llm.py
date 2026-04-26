@@ -316,18 +316,29 @@ def _call_anthropic(system_prompt: str, content_parts: list[dict]) -> str:
     """Call Anthropic Messages API and return raw text response."""
     client = _get_anthropic_client()
     ac = _to_anthropic_content(content_parts)
-    response = client.messages.create(
-        model=settings.ta_model,
-        max_tokens=8192,
-        system=system_prompt,
-        messages=[{"role": "user", "content": ac}],
-        temperature=0.2,
-    )
-    # Anthropic returns content blocks; first text block is the answer
+    kwargs: dict = {
+        "model": settings.ta_model,
+        "max_tokens": 8192,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": ac}],
+    }
+    if settings.enable_thinking:
+        # Anthropic extended thinking mode (Claude 3.7+)
+        # Note: thinking mode requires temperature=1
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+        kwargs["temperature"] = 1.0
+    else:
+        kwargs["temperature"] = 0.2
+    response = client.messages.create(**kwargs)
+    # Anthropic returns content blocks; collect text blocks (skipping thinking blocks)
+    text_parts: list[str] = []
     for block in response.content:
-        if getattr(block, "type", None) == "text":
-            return block.text
-    return ""
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_parts.append(block.text)
+        elif block_type == "thinking" and settings.enable_thinking:
+            logger.debug("Anthropic thinking: %s", getattr(block, "thinking", "")[:500])
+    return "\n".join(text_parts)
 
 
 # ---------------------------------------------------------------------------

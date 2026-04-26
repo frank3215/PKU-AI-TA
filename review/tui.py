@@ -41,9 +41,11 @@ def display_student(console: Console, row_data: dict, row_idx: int, total: int, 
         title="Review Progress",
         border_style="blue"
     ))
-    info_table = Table(show_header=False, box=None)
-    info_table.add_row("[bold]Student ID:[/]", str(row_data["student_id"]))
-    info_table.add_row("[bold]Name:[/]", str(row_data["student_name"]))
+    info_table = Table(show_header=False, box=None, expand=True)
+    info_table.add_column(style="bold", no_wrap=True, width=20)
+    info_table.add_column(overflow="fold", min_width=40)
+    info_table.add_row("Student ID:", str(row_data["student_id"]))
+    info_table.add_row("Name:", str(row_data["student_name"]))
 
     # Show override score if present
     override_score = row_data.get("reviewer_override_score")
@@ -52,21 +54,21 @@ def display_student(console: Console, row_data: dict, row_idx: int, total: int, 
             override_val = float(override_score)
             total_max = float(row_data["total_max"])
             override_pct = round((override_val / total_max) * 100, 1) if total_max > 0 else 0
-            info_table.add_row("[bold]Score:[/]", f"[red][strike]{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)[/strike][/red]")
-            info_table.add_row("[bold]Override:[/]", f"[green]{override_val} / {total_max} ({override_pct}%)[/green]")
+            info_table.add_row("Score:", f"[red][strike]{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)[/strike][/red]")
+            info_table.add_row("Override:", f"[green]{override_val} / {total_max} ({override_pct}%)[/green]")
         except (ValueError, TypeError):
-            info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+            info_table.add_row("Score:", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
     else:
-        info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+        info_table.add_row("Score:", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
 
-    info_table.add_row("[bold]Confidence:[/]", f"{row_data['confidence']}")
-    info_table.add_row("[bold]Needs review:[/]", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
-    info_table.add_row("[bold]Current approved:[/]", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
+    info_table.add_row("Confidence:", f"{row_data['confidence']}")
+    info_table.add_row("Needs review:", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
+    info_table.add_row("Current approved:", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
     current_notes = str(row_data.get("reviewer_notes") or "")
     if current_notes:
-        info_table.add_row("[bold]Reviewer notes:[/]", f"[green]{current_notes}[/green]")
+        info_table.add_row("Reviewer notes:", f"[green]{current_notes}[/green]")
     else:
-        info_table.add_row("[bold]Reviewer notes:[/]", "[dim][yellow](none)[/yellow][/dim]")
+        info_table.add_row("Reviewer notes:", "[dim][yellow](none)[/yellow][/dim]")
     console.print(Panel(info_table, title="Student Info", border_style="cyan"))
 
     if breakdown is None:
@@ -77,22 +79,29 @@ def display_student(console: Console, row_data: dict, row_idx: int, total: int, 
             console.print("[yellow]Warning: Could not parse breakdown_json[/yellow]")
 
     if breakdown:
-        bd_table = Table(title="Score Breakdown")
-        bd_table.add_column("#", style="dim", justify="right")
-        bd_table.add_column("Criterion", style="cyan")
-        bd_table.add_column("Awarded", justify="right", style="green")
-        bd_table.add_column("Max", justify="right")
-        bd_table.add_column("Reasoning", style="dim")
+        bd_table = Table(title="Score Breakdown", expand=True)
+        bd_table.add_column("#", style="dim", justify="right", no_wrap=True, width=3)
+        bd_table.add_column("Criterion", style="cyan", no_wrap=True, min_width=15, max_width=25)
+        bd_table.add_column("Awarded", justify="right", style="green", no_wrap=True, width=8)
+        bd_table.add_column("Max", justify="right", no_wrap=True, width=6)
+        bd_table.add_column("Reasoning", style="dim", overflow="fold", min_width=40)
         for i, item in enumerate(breakdown, start=1):
             awarded = float(item.get("points_awarded", 0))
             max_p = float(item.get("points_max", 0))
             style = "red" if awarded < max_p else "green"
+            reasoning = str(item.get("reasoning", ""))
+            # Truncate reasoning for perfect-score items to save space
+            if awarded >= max_p:
+                truncated = reasoning[:80] + "..." if len(reasoning) > 80 else reasoning
+                reasoning_text = Text(truncated, style="dim")
+            else:
+                reasoning_text = Text(reasoning, style="dim")
             bd_table.add_row(
                 str(i),
                 str(item.get("criterion", "")),
                 Text(f"{awarded}", style=style),
                 f"{max_p}",
-                str(item.get("reasoning", ""))
+                reasoning_text
             )
         console.print(Panel(bd_table, border_style="green"))
 
@@ -140,7 +149,7 @@ def run_review_tui(
     else:
         console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
 
-    console.print(f"[bold]Loading spreadsheet:[/bold] {scores}")
+    console.print(f"Loading spreadsheet: {scores}")
     session = ReviewSession(scores, needs_review_only, all_students)
 
     if not session.rows:

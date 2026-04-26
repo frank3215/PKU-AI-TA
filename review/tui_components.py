@@ -13,7 +13,7 @@ from typing import Any
 import openpyxl
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -282,11 +282,15 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
         else:
             console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
 
-    # Clear reviewer notes for perfect scores
+    # Ask before clearing reviewer notes for perfect scores
     if is_perfect and has_notes:
-        row_data["reviewer_notes"] = ""
-        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value="")
-        console.print("[dim]Cleared reviewer notes for perfect score.[/dim]")
+        console.print(f"\n[dim]Current notes:[/dim] {row_data['reviewer_notes']}")
+        if Confirm.ask("[bold cyan]Clear reviewer notes for this perfect score?[/bold cyan]", default=True):
+            row_data["reviewer_notes"] = ""
+            session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value="")
+            console.print("[dim]Cleared reviewer notes.[/dim]")
+        else:
+            console.print("[dim]Kept reviewer notes.[/dim]")
 
     session.ws.cell(row=row_idx, column=session.idx["approved"] + 1, value="YES")
     row_data["approved"] = "YES"
@@ -362,12 +366,21 @@ def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, floa
             awarded = float(item.get("points_awarded", 0))
             max_p = float(item.get("points_max", 0))
             style = "red" if awarded < max_p else "green"
-            bd_table.add_row(
-                str(i),
-                str(item.get("criterion", "")),
-                Text(f"{awarded}", style=style),
-                f"{max_p}"
-            )
+            # Bold the number for incorrect items so they stand out
+            if awarded < max_p:
+                bd_table.add_row(
+                    Text(str(i), style="bold underline red"),
+                    Text(str(item.get("criterion", "")), style="underline"),
+                    Text(f"{awarded}", style="underline red"),
+                    Text(f"{max_p}", style="underline"),
+                )
+            else:
+                bd_table.add_row(
+                    Text(str(i)),
+                    str(item.get("criterion", "")),
+                    Text(f"{awarded}", style=style),
+                    f"{max_p}",
+                )
         console.print(bd_table)
 
         # Calculate and show current total
