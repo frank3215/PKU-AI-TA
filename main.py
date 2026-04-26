@@ -416,7 +416,7 @@ def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) 
             safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', sub.student_name)
             filename = f"{sub.student_id}_{safe_name}{ext}"
             target = dest / filename
-            if target.exists():
+            if target.exists() and not sub.has_multiple_attempts:
                 continue
             target.write_bytes(att.data)
             written += 1

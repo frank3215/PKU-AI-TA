@@ -62,8 +62,11 @@ def _fetch_student_meta(client: httpx.Client, course_id: str, grade_book_pk: str
 
     already_graded is True when the link text is "查看" (view = already graded),
     False when it is "批改" (grade = needs grading).
+
+    When a student has multiple attempts, keeps the newest one (highest attemptPk)
+    to ensure we grade / submit to the latest submission.
     """
-    from crawler.pku_homework import _STUDENT_ONCLICK_PATTERN, _STUDENT_PATTERN
+    from crawler.pku_homework import _parse_student_list
 
     title = _fetch_assignment_title(client, course_id, grade_book_pk)
 
@@ -72,28 +75,16 @@ def _fetch_student_meta(client: httpx.Client, course_id: str, grade_book_pk: str
         params={"course_id": course_id, "gradeBookPK": grade_book_pk, "title": title, "showAll": "true"},
     )
     resp.raise_for_status()
-    html = resp.text
 
-    meta: dict[str, dict] = {}
-    for m in _STUDENT_PATTERN.finditer(html):
-        groups = m.groups()
-        if len(groups) == 6:
-            _, user_id, file_pk, _, attempt_pk, link_text = groups
-        else:
-            _, user_id, file_pk, _, attempt_pk = groups
-            link_text = ""
-        already_graded = link_text.strip() == "查看"
-        meta[user_id] = {"filePk": file_pk, "attemptPk": attempt_pk, "already_graded": already_graded}
-    for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
-        groups = m.groups()
-        if len(groups) == 4:
-            user_id, file_pk, attempt_pk, link_text = groups
-        else:
-            user_id, file_pk, attempt_pk = groups
-            link_text = ""
-        already_graded = link_text.strip() == "查看"
-        meta.setdefault(user_id, {"filePk": file_pk, "attemptPk": attempt_pk, "already_graded": already_graded})
-
+    students = _parse_student_list(resp.text, verbose=False)
+    meta: dict[str, dict] = {
+        s["userId"]: {
+            "filePk": s["filePk"],
+            "attemptPk": s["attemptPk"],
+            "already_graded": s.get("already_graded", False),
+        }
+        for s in students
+    }
     return meta, title
 
 

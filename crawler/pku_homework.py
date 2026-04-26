@@ -41,15 +41,17 @@ from models import Attachment, Submission
 HW_BASE = "/webapps/bb-homeWorkCheck-BBLEARN/homeWorkCheck"
 BB_API = "/learn/api/public/v1"
 
-# getStudentWork.do has two submission link formats:
-#   1. href="...CheckAloneWork.do?...userId=X&filePk=Y&...&attemptPk=Z">查看</a> (already graded)
-#   2. onclick="checkWork('userId','filePk','attemptPk')">批改</a> (needs grading)
+# getStudentWork.do has three submission link formats:
+#   1. href="...CheckAloneWork.do?...">查看</a>   (already graded)
+#   2. href="...CheckWork.do?...">批改</a>       (needs grading)
+#   3. onclick="checkWork('userId','filePk','attemptPk',...)">批改</a> (needs grading)
 _STUDENT_PATTERN = re.compile(
-    r'<a[^>]*CheckAloneWork\.do\?course_id=[^&]+&gradeBookPK=(\d+)'
+    r'<a[^>]*(?:CheckAloneWork|CheckWork)\.do\?course_id=[^&]+&gradeBookPK=(\d+)'
     r'&userId=(\d+)&filePk=(\d+)&title=([^&"]+)&attemptPk=(\d+)[^>]*>([^<]+)</a>'
 )
+# Flexible: checkWork may have 3+ parameters; we only need the first 3.
 _STUDENT_ONCLICK_PATTERN = re.compile(
-    r"""onclick=['"]\s*checkWork\(\s*'(\d+)'\s*,\s*'(\d+)'\s*,\s*'(\d+)'\s*,\s*'[^']*'\s*\)"""
+    r"""onclick=['"][^"]*checkWork\(\s*'(\d+)'\s*,\s*'(\d+)'\s*,\s*'(\d+)'\s*[^)]*\)"""
     r"""[^>]*>([^<]+)</a>"""
 )
 _NAME_PATTERN = re.compile(
@@ -108,7 +110,7 @@ class PKUHomeworkCrawler:
         )
         resp.raise_for_status()
 
-        students = _parse_student_list(resp.text)
+        students = _parse_student_list(resp.text, verbose=verbose)
 
         if not students:
             return []
@@ -139,11 +141,13 @@ class PKUHomeworkCrawler:
             if student_id not in self.whitelist:
                 continue
 
-            # Try local cache first
+            # Try local cache first (skip if student has multiple attempts —
+            # cached file may be an older version)
             file_bytes: bytes | None = None
             filename = ""
             content_type = ""
-            if cache_dir is not None:
+            has_multiple = student.get("has_multiple_attempts", False)
+            if cache_dir is not None and not has_multiple:
                 safe_name = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", student["name"])
                 for ext in (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".zip"):
                     candidate = cache_dir / f"{student_id}_{safe_name}{ext}"
@@ -153,7 +157,7 @@ class PKUHomeworkCrawler:
                         content_type = _guess_mime(filename)
                         break
 
-            # Cache miss → download from PKU
+            # Cache miss (or multiple attempts) → download from PKU
             if file_bytes is None:
                 if verbose:
                     print(f"  → Downloading {student_id} {student['name']}...")
@@ -186,6 +190,7 @@ class PKUHomeworkCrawler:
                 attachments=[Attachment(filename=filename, content_type=content_type, data=file_bytes)],
                 submitted_at=student.get("submitted_at", ""),
                 already_graded=student.get("already_graded", False),
+                has_multiple_attempts=student.get("has_multiple_attempts", False),
             ))
         return submissions
 
@@ -337,46 +342,73 @@ def _parse_homework_list(html: str) -> list[dict]:
     return assignments
 
 
-def _parse_student_list(html: str) -> list[dict]:
+def _parse_student_list(html: str, verbose: bool = False) -> list[dict]:
     """Extract submitted student list from getStudentWork.do HTML.
 
-    Handles two link formats:
+    Handles three link formats:
     - CheckAloneWork.do href with "查看" (view, already graded)
-    - onclick="checkWork('userId','filePk','attemptPk')" with "批改" (grade, needs grading)
+    - CheckWork.do href with "批改" (grade, needs grading)
+    - onclick="checkWork('userId','filePk','attemptPk',...)" with "批改" (grade, needs grading)
 
     For students with multiple attempts, keeps the newest one (highest attemptPk).
     Adds an 'already_graded' field to indicate if the attempt is already graded.
     """
+    import sys
+
     names = {m.group(1): m.group(2).strip() for m in _NAME_PATTERN.finditer(html)}
     student_map: dict[str, dict] = {}  # userId -> best attempt
+    all_attempts: dict[str, list[dict]] = {}  # userId -> all attempts found (for logging)
+
+    def _keep_best(user_id: str, attempt: dict, source: str) -> None:
+        if user_id not in all_attempts:
+            all_attempts[user_id] = []
+        all_attempts[user_id].append({**attempt, "source": source})
+        if user_id not in student_map or int(attempt["attemptPk"]) > int(student_map[user_id]["attemptPk"]):
+            student_map[user_id] = attempt
 
     for m in _STUDENT_PATTERN.finditer(html):
-        _, user_id, file_pk, title_enc, attempt_pk, link_text = m.groups()
+        groups = m.groups()
+        if len(groups) == 6:
+            _, user_id, file_pk, title_enc, attempt_pk, link_text = groups
+        else:
+            continue
         already_graded = link_text.strip() == "查看"
-        attempt = {
+        _keep_best(user_id, {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
             "already_graded": already_graded,
-        }
-        # Keep the one with higher attemptPk (newer attempt)
-        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
-            student_map[user_id] = attempt
+        }, source="href")
 
     for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
-        user_id, file_pk, attempt_pk, link_text = m.groups()
+        groups = m.groups()
+        if len(groups) == 4:
+            user_id, file_pk, attempt_pk, link_text = groups
+        else:
+            continue
         already_graded = link_text.strip() == "查看"
-        attempt = {
+        _keep_best(user_id, {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
             "already_graded": already_graded,
-        }
-        # Keep the one with higher attemptPk (newer attempt)
-        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
-            student_map[user_id] = attempt
+        }, source="onclick")
+
+    # Mark students with multiple attempts so caller can skip stale cache
+    for user_id, attempt in student_map.items():
+        attempt["has_multiple_attempts"] = len(all_attempts.get(user_id, [])) > 1
+
+    if verbose:
+        for user_id, attempts in sorted(all_attempts.items()):
+            if len(attempts) > 1:
+                selected = student_map[user_id]
+                lines = ", ".join(
+                    f"#{a['attemptPk']} {a['source']}({a['already_graded'] and '已批' or '未批'})"
+                    for a in attempts
+                )
+                print(f"  [attempts] {user_id}: found {len(attempts)} → [{lines}] → selected #{selected['attemptPk']}", file=sys.stderr)
 
     return list(student_map.values())
 

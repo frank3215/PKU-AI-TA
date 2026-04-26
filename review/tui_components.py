@@ -32,7 +32,7 @@ except ImportError:
         pass
 
 
-def prompt_text(prompt_label: str, default: str = "", console: Console | None = None, allow_interrupt: bool = False) -> str:
+def prompt_text(prompt_label: str, default: str = "", console: Console | None = None, allow_interrupt: bool = False, multiline: bool = False) -> str:
     """Prompt for text input using Python's built-in input() for better IME and cursor support.
 
     This is better than rich.prompt.Prompt for:
@@ -41,28 +41,55 @@ def prompt_text(prompt_label: str, default: str = "", console: Console | None = 
     - Proper backspace handling with multi-byte characters
 
     If allow_interrupt is True, KeyboardInterrupt will be raised instead of returning default.
+    If multiline is True, the user can enter multiple lines; an empty line ends input.
     """
     # Print the prompt on its own line first to avoid readline cursor position issues
     if console:
         console.print(f"{prompt_label}", end="")
-        if default:
+        if default and not multiline:
             console.print(f" [dim](default: {default})[/dim]", end="")
-        console.print()
+        if multiline:
+            console.print(" [dim](multi-line, empty line to finish)[/dim]")
+        else:
+            console.print()
     else:
-        print(f"{prompt_label}{f' (default: {default})' if default else ''}")
+        suffix = " (multi-line, empty line to finish)" if multiline else ""
+        default_hint = f" (default: {default})" if default and not multiline else ""
+        print(f"{prompt_label}{default_hint}{suffix}")
 
-    # Then just use a simple "> " prompt for input()
-    try:
-        result = input("> ")
-        return result.strip() if result.strip() != "" else default
-    except EOFError:
-        print()
-        return default
-    except KeyboardInterrupt:
-        print()
-        if allow_interrupt:
-            raise
-        return default
+    if not multiline:
+        try:
+            result = input("> ")
+            return result.strip() if result.strip() != "" else default
+        except EOFError:
+            print()
+            return default
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            return default
+
+    # Multi-line mode: keep reading until empty line
+    lines: list[str] = []
+    if default:
+        print(default)
+
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            break
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or default
 
 
 def prompt_choice(prompt_label: str, choices: list[str], default: str | None = None, console: Console | None = None) -> str:
@@ -270,7 +297,7 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
         console.print("\n[yellow]Score is not 100%. Please add reviewer notes.[/yellow]")
         current_notes = str(row_data.get("reviewer_notes") or "")
         try:
-            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True)
+            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
         except KeyboardInterrupt:
             console.print("\n[yellow]Approve cancelled.[/yellow]")
             return False
@@ -303,7 +330,7 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     current_notes = str(row_data.get("reviewer_notes") or "")
     console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
     try:
-        new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True)
+        new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
         return

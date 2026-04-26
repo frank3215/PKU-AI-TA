@@ -39,6 +39,7 @@ class Submission(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
     submitted_at: str = ""  # ISO string from platform
     already_graded: bool = False  # True if the newest attempt is already graded on PKU website
+    has_multiple_attempts: bool = False  # True if student submitted multiple times — always re-download
 
 
 class CriterionScore(BaseModel):

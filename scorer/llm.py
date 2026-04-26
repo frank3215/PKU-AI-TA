@@ -318,7 +318,7 @@ def _call_anthropic(system_prompt: str, content_parts: list[dict]) -> str:
     ac = _to_anthropic_content(content_parts)
     kwargs: dict = {
         "model": settings.ta_model,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
         "system": system_prompt,
         "messages": [{"role": "user", "content": ac}],
     }
