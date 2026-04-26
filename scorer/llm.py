@@ -42,6 +42,9 @@ def _get_client() -> OpenAI:
         _client = OpenAI(
             base_url=settings.openai_base_url,
             api_key=settings.openai_api_key,
+            default_headers={
+                "User-Agent": "Claude-Code/1.0 (Anthropic; macOS)"
+            },
         )
     return _client
 

@@ -30,8 +30,13 @@ import requests
 from config import settings
 
 IAAA_BASE = "https://iaaa.pku.edu.cn"
-BB_CAMPUS_LOGIN_URL = (
+# IAAA registered redirect URL (must stay http:// — the server rejects https:// here).
+IAAA_REDIRECT_URL = (
     "http://course.pku.edu.cn/webapps/bb-sso-BBLEARN/execute/authValidate/campusLogin"
+)
+# Actual campusLogin endpoint (PKU now requires HTTPS).
+BB_CAMPUS_LOGIN_URL = (
+    "https://course.pku.edu.cn/webapps/bb-sso-BBLEARN/execute/authValidate/campusLogin"
 )
 BB_BASE = "https://course.pku.edu.cn"
 
@@ -119,7 +124,7 @@ def get_session() -> requests.Session:
             "randCode": "",
             "smsCode": "",
             "otpCode": "",
-            "redirUrl": BB_CAMPUS_LOGIN_URL,
+            "redirUrl": IAAA_REDIRECT_URL,
         },
     )
     login_resp.raise_for_status()

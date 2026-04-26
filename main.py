@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Annotated, Optional
 from time import time
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TextColumn
