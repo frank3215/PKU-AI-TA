@@ -79,13 +79,18 @@ class PKUHomeworkCrawler:
         resp.raise_for_status()
         return _parse_homework_list(resp.text)
 
-    def fetch_submissions(self, grade_book_pk: str, title: str) -> list[Submission]:
+    def fetch_submissions(
+        self, grade_book_pk: str, title: str, cache_dir: Path | None = None
+    ) -> list[Submission]:
         """
         Fetch student submissions for one assignment.
 
         Strategy:
         - Whitelist set -> per-student: CheckWork.do + api/pdf.do (2 reqs per student)
         - No whitelist  -> batch ZIP: downloadBatch.do (1 req for all files, fast)
+
+        If *cache_dir* is provided, per-student mode will check for an existing
+        local file before hitting the network.
         """
         self._ensure_bb_user_map()
 
@@ -109,33 +114,56 @@ class PKUHomeworkCrawler:
             return []
 
         if self.whitelist:
-            return self._fetch_per_student(students, grade_book_pk, title)
+            return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir)
         else:
-            return self._fetch_batch_zip(students, grade_book_pk, title)
+            return self._fetch_batch_zip(students, grade_book_pk, title, cache_dir=cache_dir)
 
     # ------------------------------------------------------------------
     # Fetching strategies
     # ------------------------------------------------------------------
 
     def _fetch_per_student(
-        self, students: list[dict], grade_book_pk: str, title: str
+        self, students: list[dict], grade_book_pk: str, title: str,
+        cache_dir: Path | None = None,
     ) -> list[Submission]:
-        """Download individual files via CheckWork.do + api/pdf.do."""
+        """Download individual files via CheckWork.do + api/pdf.do.
+
+        If *cache_dir* is provided and a student's file already exists there,
+        the local copy is used instead of hitting the network.
+        """
+        import re
+
         submissions: list[Submission] = []
         for student in students:
             student_id = student["userId"]
             if student_id not in self.whitelist:
                 continue
 
-            file_bytes, filename, content_type = self._download_student_file(
-                grade_book_pk=grade_book_pk,
-                title=title,
-                user_id=student_id,
-                file_pk=student["filePk"],
-                attempt_pk=student["attemptPk"],
-            )
+            # Try local cache first
+            file_bytes: bytes | None = None
+            filename = ""
+            content_type = ""
+            if cache_dir is not None:
+                safe_name = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", student["name"])
+                for ext in (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".zip"):
+                    candidate = cache_dir / f"{student_id}_{safe_name}{ext}"
+                    if candidate.exists():
+                        file_bytes = candidate.read_bytes()
+                        filename = candidate.name
+                        content_type = _guess_mime(filename)
+                        break
+
+            # Cache miss → download from PKU
             if file_bytes is None:
-                continue
+                file_bytes, filename, content_type = self._download_student_file(
+                    grade_book_pk=grade_book_pk,
+                    title=title,
+                    user_id=student_id,
+                    file_pk=student["filePk"],
+                    attempt_pk=student["attemptPk"],
+                )
+                if file_bytes is None:
+                    continue
 
             submissions.append(Submission(
                 student_id=student_id,
@@ -150,11 +178,13 @@ class PKUHomeworkCrawler:
         return submissions
 
     def _fetch_batch_zip(
-        self, students: list[dict], grade_book_pk: str, title: str
+        self, students: list[dict], grade_book_pk: str, title: str,
+        cache_dir: Path | None = None,
     ) -> list[Submission]:
         """Download all files at once via downloadBatch.do ZIP.
 
-        Falls back to per-student fetching if batch download fails."""
+        Falls back to per-student fetching if batch download fails.
+        When *cache_dir* is provided the fallback uses local cached files."""
         try:
             zip_resp = self.client.get(
                 f"{HW_BASE}/downloadBatch.do",
@@ -191,7 +221,7 @@ class PKUHomeworkCrawler:
             original_whitelist = self.whitelist
             self.whitelist = {s["userId"] for s in students}
             try:
-                return self._fetch_per_student(students, grade_book_pk, title)
+                return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir)
             finally:
                 self.whitelist = original_whitelist
 

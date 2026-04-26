@@ -152,7 +152,7 @@ def grade(
             col_title = col.get("name") or col["id"]
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
-            submissions = crawler.fetch_submissions(grade_book_pk, col_title)
+            submissions = crawler.fetch_submissions(grade_book_pk, col_title, cache_dir=save_dir)
             if not submissions:
                 console.print("  No submissions found.")
                 continue
@@ -177,8 +177,12 @@ def grade(
                 console.print(f"  {len(submissions)} submission(s) remaining to process")
 
             if save_dir:
-                _save_submissions(submissions, save_dir, col_title)
-                console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
+                written = _save_submissions(submissions, save_dir, col_title)
+                skipped = len(submissions) - written
+                msg = f"  Saved files → [cyan]{save_dir / col_title}[/cyan]"
+                if skipped:
+                    msg += f" ([dim]{skipped} already cached[/dim])"
+                console.print(msg)
 
             total_submissions = len(submissions)
             console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, prompt={prompt.name})…")
@@ -343,19 +347,28 @@ def review(
         raise typer.Exit(1)
 
 
-def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> None:
-    """Save each student's attachment file to save_dir/assignment_title/ for human review."""
+def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> int:
+    """Save each student's attachment file to save_dir/assignment_title/ for human review.
+
+    Returns the number of files actually written (skips those already present).
+    """
     import re
     safe_title = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', assignment_title)
     dest = save_dir / safe_title
     dest.mkdir(parents=True, exist_ok=True)
+    written = 0
     for sub in submissions:
         for att in sub.attachments:
             ext = Path(att.filename).suffix or ""
             # Filename: studentId_studentName.ext  (e.g. 2300012345_张三.pdf)
             safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', sub.student_name)
             filename = f"{sub.student_id}_{safe_name}{ext}"
-            (dest / filename).write_bytes(att.data)
+            target = dest / filename
+            if target.exists():
+                continue
+            target.write_bytes(att.data)
+            written += 1
+    return written
 
 
 if __name__ == "__main__":
