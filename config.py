@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     # - OpenAI-compat (Qwen3): passes enable_thinking=true in extra_body
     # - Anthropic native: enables Claude 3.7+ extended thinking mode
     enable_thinking: bool = False
+    # Custom User-Agent header for Anthropic API requests (to avoid vendor blocking)
+    user_agent: str = ""
     # Number of parallel LLM scoring threads
     ta_threads: int = 4
 

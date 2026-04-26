@@ -64,9 +64,9 @@ def _get_anthropic_client():
         from anthropic import Anthropic
         kwargs = {
             "api_key": settings.openai_api_key,
-            # Override the default User-Agent to avoid vendor blocking
-            "default_headers": {"User-Agent": "claude-cli/2.1.81 (external, cli)"},
         }
+        if settings.user_agent:
+            kwargs["default_headers"] = {"User-Agent": settings.user_agent}
         # If a custom base_url is set (not the OpenAI-compat defaults), pass it through.
         if settings.openai_base_url and "openrouter" not in settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
