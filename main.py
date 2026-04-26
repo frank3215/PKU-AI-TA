@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Annotated, Optional
 from time import time
+import zipfile
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -69,6 +70,15 @@ def grade(
     def load_checkpoint() -> tuple[list[ScoringResult], set[str]]:
         """Load previous progress from output Excel file (if exists and --resume or --regrade-unapproved is set)."""
         if (resume or regrade_unapproved) and checkpoint_path.exists():
+            # Sanity check: empty or truncated Excel files cannot be loaded
+            if checkpoint_path.stat().st_size < 100:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Checkpoint file {checkpoint_path} is empty ({checkpoint_path.stat().st_size} bytes). "
+                    "A previous run may have been interrupted during save.\n"
+                    f"[dim]Hint: restore from a backup (e.g. scores_副本.xlsx) if available.[/dim]"
+                )
+                return [], set()
+
             try:
                 from review.spreadsheet import load_reviewed
                 records = load_reviewed(checkpoint_path)
@@ -84,6 +94,11 @@ def grade(
                     results = [r.result for r in records]
                     console.print(f"[bold cyan]Resuming from checkpoint:[/bold cyan] {len(results)} previously processed result(s)")
                     return results, {r.student_id for r in results}
+            except zipfile.BadZipFile as e:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Checkpoint file {checkpoint_path} is corrupted ({e}).\n"
+                    f"[dim]Hint: restore from a backup (e.g. scores_副本.xlsx) if available.[/dim]"
+                )
             except Exception as e:
                 console.print(f"[yellow]Warning: Could not load checkpoint: {e}[/yellow]")
         return [], set()

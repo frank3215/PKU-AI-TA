@@ -41,8 +41,9 @@ COLUMNS = [
 
 
 def export(results: list[ScoringResult], path: Path) -> None:
-    """Write scoring results to an Excel file."""
+    """Write scoring results to an Excel file atomically (via a temp file)."""
     import json
+    import os
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -87,7 +88,11 @@ def export(results: list[ScoringResult], path: Path) -> None:
         max_len = max((len(str(c.value or "")) for c in col), default=10)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
 
-    wb.save(path)
+    # Atomic write: save to temp file, then rename. Prevents corruption if
+    # the process is killed mid-write.
+    tmp = path.with_suffix(".xlsx.tmp")
+    wb.save(tmp)
+    os.replace(tmp, path)
 
 
 def load_reviewed(path: Path) -> list[ReviewRecord]:

@@ -190,7 +190,10 @@ class PKUHomeworkCrawler:
                 f"{HW_BASE}/downloadBatch.do",
                 params={"course_id": self.course_id, "gradeBookPK": grade_book_pk, "isGroup": "false"},
             )
-            zip_resp.raise_for_status()
+            # Generic status check — works with both requests and httpx clients
+            status = getattr(zip_resp, "status_code", getattr(zip_resp, "status", 0))
+            if status != 200:
+                raise RuntimeError(f"Batch download returned HTTP {status}")
 
             with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
                 zip_files = [(name, zf.read(name)) for name in zf.namelist()]
@@ -213,7 +216,7 @@ class PKUHomeworkCrawler:
                     already_graded=student.get("already_graded", False),
                 ))
             return submissions
-        except (httpx.HTTPStatusError, zipfile.BadZipFile) as e:
+        except (RuntimeError, zipfile.BadZipFile, Exception) as e:
             # Fall back to per-student fetching if batch download fails
             import sys
             print(f"  Batch download failed (will fetch individually): {e}", file=sys.stderr)
