@@ -137,6 +137,40 @@ def _pdf_has_embedded_images(data: bytes) -> bool:
         return False
 
 
+def _text_looks_garbled(text: str) -> bool:
+    """Detect if extracted text looks like garbled OCR from handwriting."""
+    import re
+    import unicodedata
+
+    if len(text) < 100:
+        return False
+
+    # Signal 1: High ratio of control / non-printable characters
+    control_count = sum(
+        1 for c in text
+        if unicodedata.category(c).startswith('C') and c not in '\t\n\r'
+    )
+    if control_count > len(text) * 0.01:
+        return True
+
+    # Signal 2: 3+ letter Latin sequences with no vowels (OCR garbage like "ftityi")
+    # y/Y counts as vowel to avoid false positives (fly, python, etc.)
+    vowels = set('aeiouyAEIOUY')
+    garbage_count = 0
+    for match in re.finditer(r'[a-zA-Z]{3,}', text):
+        seq = match.group()
+        if not any(c in vowels for c in seq):
+            garbage_count += 1
+    if garbage_count >= 3:  # 3+ such sequences = likely garbled OCR
+        return True
+
+    # Signal 3: Replacement characters indicating encoding failure
+    if text.count('�') > len(text) * 0.005:
+        return True
+
+    return False
+
+
 def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     if any(marker in text for marker in _UNREADABLE_MARKERS):
         return True
@@ -151,12 +185,16 @@ def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     if len(stripped) < 200:
         return True
 
-
     # Detect garbled OCR text: PDF text layer exists but is unreadable.
     # For Chinese homework, a long text with almost no CJK characters is
     # a strong signal of corrupted OCR / bad text extraction.
     cjk_count = sum(1 for ch in stripped if '\u4e00' <= ch <= '\u9fff')
-    if len(stripped) > 200 and cjk_count / len(stripped) < 0.03:
+    if len(stripped) > 200 and cjk_count / len(stripped) < 0.02:
+        return True
+
+    # NEW: Detect text that looks like bad OCR from handwritten PDFs
+    # (e.g. vector pen strokes not detected as images by _pdf_has_embedded_images)
+    if _text_looks_garbled(stripped):
         return True
 
     return False
@@ -353,18 +391,42 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
     ]
     confidence = _f(data.get("confidence"), 1.0)
 
+    # Override LLM-returned totals with the sum of breakdown to ensure consistency
+    llm_total_score = _f(data.get("total_score"))
+    llm_total_max = _f(data.get("total_max"))
+    if breakdown:
+        computed_score = sum(b.points_awarded for b in breakdown)
+        computed_max = sum(b.points_max for b in breakdown)
+        if computed_score != llm_total_score or computed_max != llm_total_max:
+            logger.warning(
+                "Correcting inconsistent totals for %s %s: "
+                "LLM returned %.1f/%.1f but breakdown sums to %.1f/%.1f",
+                submission.student_id,
+                submission.student_name,
+                llm_total_score,
+                llm_total_max,
+                computed_score,
+                computed_max,
+            )
+        total_score = computed_score
+        total_max = computed_max
+    else:
+        total_score = llm_total_score
+        total_max = llm_total_max
+
     result = ScoringResult(
         student_id=submission.student_id,
         student_name=submission.student_name,
         bb_user_id=submission.bb_user_id,
         assignment_id=submission.assignment_id,
-        total_score=_f(data.get("total_score")),
-        total_max=_f(data.get("total_max")),
+        total_score=total_score,
+        total_max=total_max,
         breakdown=breakdown,
         uncertain_parts=uncertain,
         confidence=confidence,
         llm_reasoning=data.get("llm_reasoning", ""),
-        needs_review=confidence < settings.review_threshold or len(uncertain) > 0,
+        student_feedback=data.get("student_feedback", ""),
+        needs_review=(confidence < settings.review_threshold or len(uncertain) > 0 or total_score < total_max),
         processing_notes=processing_notes,
     )
 
@@ -393,23 +455,63 @@ def _sanitize_json(s: str) -> str:
     return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
 
 
+def _fix_string_newlines(s: str) -> str:
+    """Replace raw newlines inside JSON double-quoted strings with escaped \\n."""
+    result: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if escape:
+            result.append(ch)
+            escape = False
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string and ch in '\n\r':
+            result.append('\\n')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
 def _parse_json(raw: str) -> dict:
     """Extract JSON from model output, tolerating minor formatting issues."""
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     cleaned = cleaned.strip()
-    for candidate in [cleaned, _sanitize_json(cleaned)]:
+
+    # Try progressively more aggressive fixes
+    fixes = [
+        lambda x: x,                                    # raw
+        _fix_string_newlines,                           # fix newlines in strings
+        _sanitize_json,                                 # fix stray backslashes
+        lambda x: _sanitize_json(_fix_string_newlines(x)),  # both
+    ]
+    for fix in fixes:
+        candidate = fix(cleaned)
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
             pass
+
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         block = match.group()
-        for candidate in [block, _sanitize_json(block)]:
+        for fix in fixes:
+            candidate = fix(block)
             try:
                 return json.loads(candidate)
             except json.JSONDecodeError:
                 pass
-    raise ValueError(f"Could not parse LLM response as JSON:\n{raw[:500]}")
+    # Log full raw response for debugging (no truncation)
+    logger.error("Could not parse LLM response as JSON. Full raw response:\n%s", raw)
+    exc = ValueError(f"Could not parse LLM response as JSON. Full raw response:\n{raw}")
+    exc.raw_response = raw  # Attach full response for verbose debug output
+    raise exc

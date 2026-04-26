@@ -72,7 +72,7 @@ def export(results: list[ScoringResult], path: Path) -> None:
             json.dumps([u.model_dump() for u in r.uncertain_parts], ensure_ascii=False),
             r.llm_reasoning,
             "",   # reviewer_override_score
-            "",   # reviewer_notes
+            r.student_feedback,   # reviewer_notes — pre-filled with LLM feedback for students
             "NO", # approved — reviewer changes to YES
         ]
         for col, value in enumerate(row_data, start=1):
@@ -127,6 +127,7 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
             breakdown=breakdown,
             uncertain_parts=uncertain,
             llm_reasoning=str(row[idx["llm_reasoning"]] or ""),
+            student_feedback=str(row[idx["reviewer_notes"]] or ""),
         )
 
         override_raw = row[idx["reviewer_override_score"]]

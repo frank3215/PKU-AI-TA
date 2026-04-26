@@ -277,8 +277,19 @@ def grade(
                                     # Show full description in verbose mode
                                     desc = up.description.strip()
                                     console.print(f"    [dim yellow]⚠ {desc}[/]")
+                                # Show deductions inline so the user sees why points were lost
+                                for b in result.breakdown:
+                                    if b.points_awarded < b.points_max:
+                                        console.print(f"    [dim red]− {b.criterion} ({b.points_awarded:.0f}/{b.points_max:.0f}): {b.reasoning.strip()}[/]")
+                                # Show student-facing feedback (reviewer_notes) for non-perfect scores
+                                if result.student_feedback:
+                                    console.print(f"    [dim cyan]→ Feedback: {result.student_feedback}[/]")
                         except Exception as e:
                             console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
+                            if verbose and hasattr(e, 'raw_response'):
+                                console.print(f"  [dim red]--- Full raw response ---[/]")
+                                console.print(f"[dim]{e.raw_response}[/]")
+                                console.print(f"  [dim red]--- End raw response ---[/]")
                         finally:
                             progress.advance(task)
                 finally:

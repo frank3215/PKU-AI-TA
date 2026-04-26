@@ -282,6 +282,12 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
         else:
             console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
 
+    # Clear reviewer notes for perfect scores
+    if is_perfect and has_notes:
+        row_data["reviewer_notes"] = ""
+        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value="")
+        console.print("[dim]Cleared reviewer notes for perfect score.[/dim]")
+
     session.ws.cell(row=row_idx, column=session.idx["approved"] + 1, value="YES")
     row_data["approved"] = "YES"
     session.update_row(row_idx, row_data)
