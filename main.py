@@ -25,6 +25,155 @@ app = typer.Typer(help="PKU AI Teaching Assistant")
 console = Console()
 
 
+def _interactive_grade_setup(
+    course: str,
+    column: str,
+    rubric: Path,
+    whitelist: str,
+    out: Path,
+    save_dir: Optional[Path],
+    prompt_file: Path,
+    threads: int,
+    due_date: Optional[str],
+    console: Console,
+) -> tuple[str, str, Path, str, Path, Optional[Path], Path, int, Optional[str]]:
+    """Interactively prompt for grade parameters with .env defaults."""
+    from config import settings
+    from review.tui_components import prompt_text
+
+    # --- course ---
+    course_id = course or settings.course_id
+    if not course_id:
+        course_id = prompt_text("Course ID (e.g. _12345_1)", default="", console=console)
+    if not course_id:
+        console.print("[red]Error: course_id is required[/red]")
+        raise typer.Exit(1)
+
+    # --- column (fetch assignments if missing) ---
+    if not column:
+        from auth.iaaa import get_session
+        from crawler.pku_homework import PKUHomeworkCrawler
+        from rich.table import Table
+
+        console.print("\n[bold]Authenticating with PKU IAAA…[/bold]")
+        client = get_session()
+        crawler = PKUHomeworkCrawler(client, course_id, set())
+        assignments = crawler.fetch_assignments()
+
+        if not assignments:
+            console.print("[yellow]No assignments found.[/yellow]")
+            raise typer.Exit(0)
+
+        table = Table(title=f"Assignments ({len(assignments)})")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Name", style="cyan")
+        table.add_column("gradeBookPK (--column)", style="green", no_wrap=True)
+        table.add_column("Submitted", justify="right")
+        table.add_column("Graded", justify="right")
+        table.add_column("Ungraded", justify="right")
+        for i, a in enumerate(assignments, 1):
+            pk = a.get("gradeBookPK") or a["id"].strip("_").split("_")[0]
+            name = a.get("name", "")
+            try:
+                counts = crawler.count_submissions(pk, name)
+                submitted = str(counts["total"])
+                graded = f"[green]{counts['graded']}[/green]" if counts["graded"] else "0"
+                ungraded = f"[yellow]{counts['ungraded']}[/yellow]" if counts["ungraded"] else "0"
+            except Exception:
+                submitted = "err"
+                graded = "err"
+                ungraded = "err"
+            table.add_row(str(i), name, pk, submitted, graded, ungraded)
+        console.print(table)
+
+        choice = prompt_text("Select assignment (number or gradeBookPK)", default="", console=console)
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(assignments):
+                column = assignments[idx].get("gradeBookPK") or assignments[idx]["id"].strip("_").split("_")[0]
+            else:
+                column = choice
+        except ValueError:
+            column = choice
+    if not column:
+        console.print("[red]Error: --column is required[/red]")
+        raise typer.Exit(1)
+
+    # --- rubric ---
+    if not rubric.exists():
+        candidates = [p for p in Path(".").iterdir() if p.is_file() and "rubric" in p.name.lower()]
+        if not candidates:
+            candidates = sorted([p for p in Path(".").glob("*.md") if p.is_file()], key=lambda p: p.name)
+        if candidates:
+            console.print("\n[yellow]Rubric file not found.[/yellow] Available candidates:")
+            for i, c in enumerate(candidates[:10], 1):
+                marker = " [green](recommended)[/green]" if "rubric" in c.name.lower() else ""
+                console.print(f"  {i}. {c}{marker}")
+            choice = prompt_text("Select rubric (number or path)", default="", console=console)
+            try:
+                rubric = candidates[int(choice) - 1]
+            except (ValueError, IndexError):
+                rubric = Path(choice) if choice else rubric
+    if rubric.exists():
+        confirmed = prompt_text("Rubric file", default=str(rubric), console=console)
+        rubric = Path(confirmed) if confirmed else rubric
+    if not rubric.exists():
+        console.print(f"[red]Error: Rubric file not found: {rubric}[/red]")
+        raise typer.Exit(1)
+
+    # --- whitelist ---
+    whitelist_default = whitelist or settings.student_whitelist
+    student_list_path = Path("student_list")
+    if not whitelist_default and student_list_path.exists():
+        student_list_content = ",".join(
+            line.strip() for line in student_list_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+        if student_list_content:
+            console.print(f"  [dim]Auto-loaded {student_list_content.count(',') + 1} student(s) from student_list[/dim]")
+            whitelist = student_list_content
+        else:
+            whitelist_input = prompt_text(
+                "Student whitelist (comma-separated, empty = all students)",
+                default="",
+                console=console,
+            )
+            whitelist = whitelist_input or ""
+    else:
+        whitelist_input = prompt_text(
+            "Student whitelist (comma-separated, empty = all students)",
+            default=whitelist_default,
+            console=console,
+        )
+        whitelist = whitelist_input or ""
+
+    # --- out ---
+    out_str = prompt_text("Output Excel file", default=str(out), console=console)
+    out = Path(out_str) if out_str else out
+
+    # --- save_dir ---
+    save_dir_default = str(save_dir) if save_dir else "submissions"
+    save_dir_str = prompt_text("Submission save directory", default=save_dir_default, console=console)
+    save_dir = Path(save_dir_str) if save_dir_str else None
+
+    # --- prompt ---
+    prompt_str = prompt_text("System prompt file", default=str(prompt_file), console=console)
+    prompt_file = Path(prompt_str) if prompt_str else prompt_file
+
+    # --- threads ---
+    threads_default = str(threads if threads > 0 else settings.ta_threads)
+    threads_str = prompt_text("Parallel scoring threads", default=threads_default, console=console)
+    try:
+        threads = int(threads_str) if threads_str else (threads if threads > 0 else settings.ta_threads)
+    except ValueError:
+        threads = settings.ta_threads
+
+    # --- due_date ---
+    due_str = prompt_text("Due date (ISO 8601, empty = auto-fetch from Blackboard)", default=due_date or "", console=console)
+    due_date = due_str or due_date
+
+    return course_id, column, rubric, whitelist, out, save_dir, prompt_file, threads, due_date
+
+
 @app.command()
 def grade(
     course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
@@ -39,6 +188,7 @@ def grade(
     prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_zh.md)")] = Path("prompts/system_zh.md"),
     threads: Annotated[int, typer.Option(help="Parallel scoring threads (default: from .env or 4)")] = 0,
     due_date: Annotated[Optional[str], typer.Option(help="Assignment due date (ISO 8601, e.g. 2026-03-22T15:59:00). Auto-fetched from Blackboard if omitted.")] = None,
+    interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Interactively prompt for missing parameters")] = False,
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -47,6 +197,8 @@ def grade(
 
     Use --regrade-unapproved to keep already-approved students and only regrade
     those that haven't been approved yet.
+
+    Use --interactive (or -i) to interactively fill in missing parameters.
     """
     from threading import Lock
 
@@ -127,11 +279,54 @@ def grade(
         all_results = []
         processed_ids = set()
 
-    # Resolve config — CLI args override .env
+    # Enter interactive mode if explicitly requested or critical params are missing
     course_id = course or settings.course_id
+    needs_interactive = interactive or not course_id or not column
+    if needs_interactive:
+        if interactive:
+            console.print("[bold cyan]Interactive mode enabled.[/bold cyan] Press Enter to accept defaults from .env.\n")
+        course_id, column, rubric, whitelist, out, save_dir, prompt, threads, due_date = _interactive_grade_setup(
+            course=course,  # pass raw CLI value so setup can distinguish .env default from explicit arg
+            column=column,
+            rubric=rubric,
+            whitelist=whitelist,
+            out=out,
+            save_dir=save_dir,
+            prompt_file=prompt,
+            threads=threads,
+            due_date=due_date,
+            console=console,
+        )
+        # Re-apply thread override after interactive setup
+        if threads > 0:
+            settings.ta_threads = threads
+        checkpoint_path = out
+
     if not course_id:
         console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
         raise typer.Exit(1)
+
+    # Build resume command for display on interrupt
+    def _build_resume_cmd() -> str:
+        parts = [f"--course {course_id}", f"--column {column}", f"--rubric {rubric}"]
+        if whitelist:
+            parts.append(f"--whitelist {whitelist}")
+        if str(out) != "scores.xlsx":
+            parts.append(f"--out {out}")
+        if save_dir and str(save_dir) != "submissions":
+            parts.append(f"--save-dir {save_dir}")
+        if verbose:
+            parts.append("--verbose")
+        if regrade_unapproved:
+            parts.append("--regrade-unapproved")
+        if str(prompt) != "prompts/system_zh.md":
+            parts.append(f"--prompt {prompt}")
+        if threads > 0 and threads != settings.ta_threads:
+            parts.append(f"--threads {threads}")
+        if due_date:
+            parts.append(f"--due-date {due_date}")
+        parts.append("--resume")
+        return f"uv run python main.py grade {' '.join(parts)}"
 
     # Determine whitelist:
     # - If --regrade-unapproved: only regrade unapproved students
@@ -311,7 +506,8 @@ def grade(
             console.print(f"[yellow]Saving {len(all_results)} partial result(s)...[/yellow]")
             save_checkpoint()
             console.print(f"[cyan]Checkpoint saved to {checkpoint_path}[/cyan]")
-            console.print(f"[cyan]Resume later with: --resume[/cyan]")
+            console.print(f"[dim]Resume later with:[/dim]")
+            console.print(f"[bold cyan]{_build_resume_cmd()}[/bold cyan]")
         raise typer.Exit(1)
 
     if not all_results:
