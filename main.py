@@ -471,16 +471,24 @@ def grade(
                                 color = "yellow" if needs_review else "green"
                                 status = "NEEDS_REVIEW" if needs_review else "OK"
                                 mode_color = "cyan" if result.processing_notes == "text" else "magenta"
+                                conf_color = "yellow" if result.confidence < settings.review_threshold else "dim"
                                 console.print(
                                     f"  [{color}]{result.student_id:12s}[/] {result.student_name:10s} "
                                     f"→ {result.total_score:3.0f}/{result.total_max:3.0f} ({result.pct:3.0f}%) "
-                                    f"[{color}]{status}[/] [{mode_color}]{result.processing_notes}[/]"
+                                    f"[{color}]{status}[/] [{mode_color}]{result.processing_notes}[/] "
+                                    f"[{conf_color}]conf={result.confidence:.2f}[/]"
                                 )
                                 # Show uncertain parts inline so rubric issues are visible immediately
-                                for up in result.uncertain_parts:
-                                    # Show full description in verbose mode
-                                    desc = up.description.strip()
-                                    console.print(f"    [dim yellow]⚠ {desc}[/]")
+                                if result.uncertain_parts:
+                                    for up in result.uncertain_parts:
+                                        desc = up.description.strip()
+                                        console.print(f"    [dim yellow]⚠ {desc}[/]")
+                                elif needs_review:
+                                    # needs_review but no uncertain_parts → flag why
+                                    if result.confidence < settings.review_threshold:
+                                        console.print(f"    [dim yellow]⚠ confidence {result.confidence:.2f} < threshold {settings.review_threshold}[/]")
+                                    elif result.total_score < result.total_max:
+                                        console.print(f"    [dim yellow]⚠ score < max ({result.total_score:.0f}/{result.total_max:.0f})[/]")
                                 # Show deductions inline so the user sees why points were lost
                                 for b in result.breakdown:
                                     if b.points_awarded < b.points_max:
