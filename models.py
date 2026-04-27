@@ -69,6 +69,8 @@ class ScoringResult(BaseModel):
     student_feedback: str = ""  # brief student-facing deduction summary, e.g. "扣2分：输出顺序与题目要求相反"
     needs_review: bool = False  # set True when confidence < threshold or uncertain_parts exist
     processing_notes: str = ""  # e.g. "text", "vision", "text+vision" — how attachments were sent to LLM
+    late_days: float = 0.0  # days late (0 = on time)
+    late_penalty: float = 0.0  # points deducted for late submission
 
     @property
     def pct(self) -> float:

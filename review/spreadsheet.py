@@ -30,6 +30,8 @@ COLUMNS = [
     "pct",
     "confidence",
     "needs_review",
+    "late_days",
+    "late_penalty",
     "breakdown_json",
     "uncertain_parts_json",
     "llm_reasoning",
@@ -68,6 +70,8 @@ def export(results: list[ScoringResult], path: Path) -> None:
             r.pct,
             r.confidence,
             "YES" if r.needs_review else "NO",
+            round(r.late_days, 2),
+            r.late_penalty,
             json.dumps([b.model_dump() for b in r.breakdown], ensure_ascii=False),
             json.dumps([u.model_dump() for u in r.uncertain_parts], ensure_ascii=False),
             r.llm_reasoning,
@@ -150,6 +154,8 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
             uncertain_parts=uncertain,
             llm_reasoning=str(row[idx["llm_reasoning"]] or ""),
             student_feedback=str(row[idx["reviewer_notes"]] or ""),
+            late_days=float(row[idx["late_days"]]) if "late_days" in idx and row[idx["late_days"]] not in (None, "") else 0.0,
+            late_penalty=float(row[idx["late_penalty"]]) if "late_penalty" in idx and row[idx["late_penalty"]] not in (None, "") else 0.0,
         )
 
         override_raw = row[idx["reviewer_override_score"]]

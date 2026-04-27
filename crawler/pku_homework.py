@@ -58,6 +58,11 @@ _NAME_PATTERN = re.compile(
     r'scope="row"[^>]*>\s*(\d{10})\s*</th>.*?table-data-cell-value">(.*?)</span>',
     re.DOTALL,
 )
+# Matches submitted_at for each student row in getStudentWork.do HTML.
+_SUBMITTED_AT_PATTERN = re.compile(
+    r'scope="row"[^>]*>\s*(\d{10})\s*</th>.*?提交时间[:\s]*</span>\s*<span[^>]*>([\d\-:\s]+)</span>',
+    re.DOTALL,
+)
 _FILE_PATH_PATTERN = re.compile(r"(?:var|const) filePath = '([^']+)'")
 
 
@@ -106,6 +111,23 @@ class PKUHomeworkCrawler:
         total = len(students)
         graded = sum(1 for s in students if s.get("already_graded"))
         return {"total": total, "graded": graded, "ungraded": total - graded}
+
+    def fetch_due_date(self, grade_book_pk: str) -> str:
+        """Fetch assignment due date via Blackboard REST API.
+
+        Returns ISO 8601 string (e.g. '2026-03-22T15:59:00.000Z') or empty string.
+        """
+        col_id = f"_{grade_book_pk}_1"
+        try:
+            resp = self.client.get(
+                f"{BB_API}/courses/{self.course_id}/gradebook/columns/{col_id}"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            due = data.get("grading", {}).get("due", "")
+            return due
+        except Exception:
+            return ""
 
     def fetch_submissions(
         self, grade_book_pk: str, title: str, cache_dir: Path | None = None, verbose: bool = False
@@ -382,6 +404,7 @@ def _parse_student_list(html: str, verbose: bool = False) -> list[dict]:
     import sys
 
     names = {m.group(1): m.group(2).strip() for m in _NAME_PATTERN.finditer(html)}
+    submitted_ats = {m.group(1): m.group(2).strip() for m in _SUBMITTED_AT_PATTERN.finditer(html)}
     student_map: dict[str, dict] = {}  # userId -> best attempt
     all_attempts: dict[str, list[dict]] = {}  # userId -> all attempts found (for logging)
 
@@ -405,6 +428,7 @@ def _parse_student_list(html: str, verbose: bool = False) -> list[dict]:
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
             "already_graded": already_graded,
+            "submitted_at": submitted_ats.get(user_id, ""),
         }, source="href")
 
     for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
@@ -420,6 +444,7 @@ def _parse_student_list(html: str, verbose: bool = False) -> list[dict]:
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
             "already_graded": already_graded,
+            "submitted_at": submitted_ats.get(user_id, ""),
         }, source="onclick")
 
     # Mark students with multiple attempts so caller can skip stale cache

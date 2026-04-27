@@ -38,6 +38,7 @@ def grade(
     regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
     prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_zh.md)")] = Path("prompts/system_zh.md"),
     threads: Annotated[int, typer.Option(help="Parallel scoring threads (default: from .env or 4)")] = 0,
+    due_date: Annotated[Optional[str], typer.Option(help="Assignment due date (ISO 8601, e.g. 2026-03-22T15:59:00). Auto-fetched from Blackboard if omitted.")] = None,
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -54,7 +55,7 @@ def grade(
     from crawler.pku_homework import PKUHomeworkCrawler
     from review.spreadsheet import export
     from scorer.llm import score_submission
-    from models import ScoringResult
+    from models import CriterionScore, ScoringResult
 
     # Override thread count from CLI if explicitly set
     if threads > 0:
@@ -172,6 +173,13 @@ def grade(
             col_title = col.get("name") or col["id"]
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
+            # Resolve due date: CLI arg > REST API > skip late-check
+            due_dt_str = due_date or crawler.fetch_due_date(grade_book_pk)
+            if due_dt_str:
+                console.print(f"  Due date: {due_dt_str}")
+            else:
+                console.print("  [yellow]Warning: could not determine due date — late penalties disabled[/yellow]")
+
             submissions = crawler.fetch_submissions(grade_book_pk, col_title, cache_dir=save_dir, verbose=verbose)
             if not submissions:
                 console.print("  No submissions found.")
@@ -229,6 +237,7 @@ def grade(
                         sub = futures[future]
                         try:
                             result = future.result()
+                            _apply_late_penalty(result, sub, due_dt_str, console)
                             all_results.append(result)
                             processed_ids.add(result.student_id)
                             completed_count += 1
@@ -460,6 +469,59 @@ def review(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
+
+
+def _apply_late_penalty(result, submission, due_dt_str: str, console) -> None:
+    """Apply 10-point late penalty if submission is ≤7 days late."""
+    from datetime import datetime, timezone
+
+    if not due_dt_str or not submission.submitted_at:
+        return
+
+    try:
+        # Parse due date (ISO 8601 with Z or +00:00)
+        due_str = due_dt_str.replace("Z", "+00:00")
+        due_dt = datetime.fromisoformat(due_str)
+        # Parse submitted_at (local time, treat as UTC for comparison)
+        sub_dt = datetime.strptime(submission.submitted_at, "%Y-%m-%d %H:%M:%S")
+        sub_dt = sub_dt.replace(tzinfo=timezone.utc)
+
+        delta = sub_dt - due_dt
+        late_days = delta.total_seconds() / 86400
+
+        if late_days > 0:
+            result.late_days = late_days
+            if late_days <= 7:
+                penalty = min(10.0, result.total_score)
+                result.late_penalty = penalty
+                result.total_score -= penalty
+                result.breakdown.append(
+                    CriterionScore(
+                        criterion="晚交扣分",
+                        points_awarded=-penalty,
+                        points_max=0,
+                        reasoning=f"晚交 {late_days:.1f} 天（截止 {submission.submitted_at}，提交 {submission.submitted_at}），扣 10 分",
+                    )
+                )
+                result.needs_review = True
+                if result.student_feedback:
+                    result.student_feedback += f"\n晚交 {late_days:.1f} 天，扣 10 分。"
+                else:
+                    result.student_feedback = f"晚交 {late_days:.1f} 天，扣 10 分。"
+                console.print(f"  [yellow]{submission.student_id} 晚交 {late_days:.1f} 天，扣 10 分[/yellow]")
+            else:
+                console.print(f"  [red]{submission.student_id} 晚交超过 7 天（{late_days:.1f} 天），跳过评分[/red]")
+                result.total_score = 0
+                result.breakdown = [CriterionScore(
+                    criterion="晚交超过 7 天",
+                    points_awarded=0,
+                    points_max=result.total_max,
+                    reasoning=f"晚交 {late_days:.1f} 天，超过 7 天限制，不予批改",
+                )]
+                result.student_feedback = "晚交超过 7 天，不予批改。"
+                result.needs_review = True
+    except Exception:
+        pass
 
 
 def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> int:
