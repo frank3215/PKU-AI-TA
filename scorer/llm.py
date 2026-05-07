@@ -498,6 +498,8 @@ def _parse_json(raw: str) -> dict:
     cleaned = re.sub(r"\s*```$", "", cleaned)
     cleaned = cleaned.strip()
 
+    last_err: json.JSONDecodeError | None = None
+
     # Try progressively more aggressive fixes
     fixes = [
         lambda x: x,                                    # raw
@@ -509,8 +511,8 @@ def _parse_json(raw: str) -> dict:
         candidate = fix(cleaned)
         try:
             return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            last_err = e
 
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
@@ -519,10 +521,21 @@ def _parse_json(raw: str) -> dict:
             candidate = fix(block)
             try:
                 return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                last_err = e
+
+    # Build diagnostic detail from the last JSONDecodeError
+    err_detail = ""
+    if last_err is not None:
+        snippet = last_err.doc[max(0, last_err.pos - 40):last_err.pos + 40]
+        snippet = snippet.replace("\n", "\\n").replace("\r", "\\r")
+        err_detail = (
+            f" (JSON error at line {last_err.lineno}, col {last_err.colno}: {last_err.msg}; "
+            f"near: ...{snippet}...)"
+        )
+
     # Log full raw response for debugging (no truncation)
-    logger.error("Could not parse LLM response as JSON. Full raw response:\n%s", raw)
-    exc = ValueError(f"Could not parse LLM response as JSON. Full raw response:\n{raw}")
+    logger.error("Could not parse LLM response as JSON%s. Full raw response:\n%s", err_detail, raw)
+    exc = ValueError(f"Could not parse LLM response as JSON{err_detail}. Full raw response:\n{raw}")
     exc.raw_response = raw  # Attach full response for verbose debug output
     raise exc

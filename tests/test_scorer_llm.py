@@ -95,7 +95,7 @@ class TestScoreSubmission:
             assert result.total_score == 85.0
             assert result.total_max == 100.0
             assert len(result.breakdown) == 2
-            assert result.needs_review is False  # confidence=0.9 > threshold=0.75
+            assert result.needs_review is True   # 85/100 is not full score → flagged for review
         finally:
             settings.llm_provider = original_provider
 
