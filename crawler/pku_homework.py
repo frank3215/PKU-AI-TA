@@ -84,7 +84,9 @@ class PKUHomeworkCrawler:
             params={"course_id": self.course_id},
         )
         resp.raise_for_status()
-        return _parse_homework_list(resp.text)
+        assignments = _parse_homework_list(resp.text)
+        assignments.reverse()  # newest first
+        return assignments
 
     def count_submissions(self, grade_book_pk: str, title: str) -> dict:
         """Return submission counts for one assignment without downloading files.

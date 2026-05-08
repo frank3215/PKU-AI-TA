@@ -68,15 +68,30 @@ def display_student(console: Console, row_data: dict, row_idx: int, total: int, 
         mode_color = "cyan" if processing_notes == "text" else "magenta"
         info_table.add_row("Processing mode:", f"[{mode_color}]{processing_notes}[/{mode_color}]")
 
-    # Consistency check: breakdown sum vs total_score
+    # Late submission info
+    late_days = float(row_data.get("late_days") or 0)
+    late_penalty = float(row_data.get("late_penalty") or 0)
+    if late_days > 0:
+        if late_days > 7:
+            late_msg = f"[red]Late {late_days:.1f} day(s), no grade (>7d limit)[/red]"
+        else:
+            late_msg = f"[yellow]Late {late_days:.1f} day(s), penalty {late_penalty:.0f}pt[/yellow]"
+        info_table.add_row("Late submission:", late_msg)
+
+    # Consistency check: breakdown sum vs total_score (accounting for late penalty)
     consistency_msg = ""
     try:
         bd_check = json.loads(row_data.get("breakdown_json", "[]") or "[]") if row_data.get("breakdown_json") else []
         if bd_check:
             bd_sum = sum(float(b.get("points_awarded", 0) or 0) for b in bd_check)
             total_raw = float(row_data.get("total_score", 0) or 0)
-            if abs(bd_sum - total_raw) > 0.01:
+            lp = float(row_data.get("late_penalty") or 0)
+            # Match if: (1) late penalty is in breakdown (bd_sum == total_raw)
+            #           (2) late penalty is NOT in breakdown (bd_sum == total_raw + lp)
+            if abs(bd_sum - total_raw) > 0.01 and (lp <= 0 or abs(bd_sum - (total_raw + lp)) > 0.01):
                 consistency_msg = f"[red]INCONSISTENT: breakdown sum = {bd_sum:.1f}, total = {total_raw:.1f}[/red]"
+                if lp > 0:
+                    consistency_msg += f" (late penalty {lp:.0f}pt not accounted for)"
     except (json.JSONDecodeError, ValueError, TypeError):
         consistency_msg = "[yellow]Warning: Could not verify score consistency[/yellow]"
     if consistency_msg:
@@ -218,7 +233,7 @@ def run_review_tui(
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes→editor (T)ext→prompt (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes→editor (T)ype (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,

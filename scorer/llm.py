@@ -534,8 +534,15 @@ def _parse_json(raw: str) -> dict:
             f"near: ...{snippet}...)"
         )
 
+    # Save raw response to file for post-mortem debugging
+    debug_path = Path("debug_llm_response.json")
+    try:
+        debug_path.write_text(raw, encoding="utf-8")
+    except OSError:
+        pass
+
     # Log full raw response for debugging (no truncation)
     logger.error("Could not parse LLM response as JSON%s. Full raw response:\n%s", err_detail, raw)
-    exc = ValueError(f"Could not parse LLM response as JSON{err_detail}. Full raw response:\n{raw}")
+    exc = ValueError(f"Could not parse LLM response as JSON{err_detail}. Full raw response saved to {debug_path}.\n{raw}")
     exc.raw_response = raw  # Attach full response for verbose debug output
     raise exc

@@ -162,6 +162,24 @@ def _suggest_override_from_notes(notes: str, total_max: float) -> float | None:
     return max(0.0, total_max - total_deduction)
 
 
+def _ensure_late_note(row_data: dict, notes: str) -> str:
+    """Append late submission info to notes if missing."""
+    late_days = float(row_data.get("late_days") or 0)
+    late_penalty = float(row_data.get("late_penalty") or 0)
+    if late_days <= 0:
+        return notes
+    if "晚交" in notes or "迟交" in notes or "late" in notes.lower():
+        return notes
+    # Build late note line
+    if late_days > 7:
+        late_line = f"晚交 {late_days:.1f} 天，超过 7 天限制，不予批改。"
+    else:
+        late_line = f"晚交 {late_days:.1f} 天，扣 {late_penalty:.0f} 分。"
+    if notes.strip():
+        return notes.rstrip("\n") + "\n" + late_line
+    return late_line
+
+
 def _maybe_offer_override(
     session: ReviewSession,
     row_idx: int,
@@ -445,13 +463,18 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
                         pa = 0.0
                     breakdown_sum += float(pa)
                 total_score_raw = float(row_data.get("total_score", 0) or 0)
-                if abs(breakdown_sum - total_score_raw) > 0.01:
+                lp = float(row_data.get("late_penalty") or 0)
+                # Match if: (1) late penalty is in breakdown (bd_sum == total_raw)
+                #           (2) late penalty is NOT in breakdown (bd_sum == total_raw + lp)
+                if abs(breakdown_sum - total_score_raw) > 0.01 and (lp <= 0 or abs(breakdown_sum - (total_score_raw + lp)) > 0.01):
                     console.print(
                         f"\n[red]Score inconsistency detected:[/red] "
                         f"breakdown sum = [yellow]{breakdown_sum:.1f}[/yellow], "
                         f"total_score = [yellow]{total_score_raw:.1f}[/yellow] "
                         f"(diff = [red]{breakdown_sum - total_score_raw:+.1f}[/red])"
                     )
+                    if lp > 0:
+                        console.print(f"[dim]Late penalty {lp:.0f}pt not accounted for in breakdown.[/dim]")
                     console.print("[dim]Use [bold](ov) override[/bold] to set a manual score before approving.[/dim]")
                     return False
             except json.JSONDecodeError:
@@ -501,6 +524,14 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     console.print("[green]Updated reviewer notes.[/green]")
     _maybe_offer_override(session, row_idx, row_data, console, new_notes)
 
+    # Auto-append late submission info if missing
+    augmented = _ensure_late_note(row_data, new_notes)
+    if augmented != new_notes:
+        row_data["reviewer_notes"] = augmented
+        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=augmented)
+        session.update_row(row_idx, row_data)
+        console.print("[dim]Auto-appended late submission note.[/dim]")
+
 
 def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'notes text' action (T). Uses built-in multiline prompt (no editor)."""
@@ -516,6 +547,15 @@ def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, co
     session.update_row(row_idx, row_data)
     console.print("[green]Updated reviewer notes.[/green]")
     _maybe_offer_override(session, row_idx, row_data, console, new_notes)
+
+    # Auto-append late submission info if missing
+    augmented = _ensure_late_note(row_data, new_notes)
+    if augmented != new_notes:
+        row_data["reviewer_notes"] = augmented
+        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=augmented)
+        session.update_row(row_idx, row_data)
+        console.print("[dim]Auto-appended late submission note.[/dim]")
+
 
 def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown: list, console: Console) -> list:
     """Handle the 'edit' action."""
