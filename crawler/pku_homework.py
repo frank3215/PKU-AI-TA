@@ -114,11 +114,15 @@ class PKUHomeworkCrawler:
         graded = sum(1 for s in students if s.get("already_graded"))
         return {"total": total, "graded": graded, "ungraded": total - graded}
 
-    def fetch_due_date(self, grade_book_pk: str) -> str:
-        """Fetch assignment due date via Blackboard REST API.
+    def fetch_due_date(self, grade_book_pk: str, title: str = "") -> str:
+        """Fetch assignment due date.
+
+        Tries Blackboard REST API first, then falls back to parsing
+        the getStudentWork.do HTML page (which we already visit).
 
         Returns ISO 8601 string (e.g. '2026-03-22T15:59:00.000Z') or empty string.
         """
+        # --- Attempt 1: Blackboard REST API ---
         col_id = f"_{grade_book_pk}_1"
         try:
             resp = self.client.get(
@@ -126,10 +130,47 @@ class PKUHomeworkCrawler:
             )
             resp.raise_for_status()
             data = resp.json()
-            due = data.get("grading", {}).get("due", "")
-            return due
+            for path in (
+                lambda d: d.get("due", ""),
+                lambda d: d.get("grading", {}).get("due", ""),
+                lambda d: d.get("availability", {}).get("availability_dates", {}).get("due", ""),
+            ):
+                due = path(data)
+                if due:
+                    return due
         except Exception:
-            return ""
+            pass
+
+        # --- Attempt 2: Parse getStudentWork.do HTML ---
+        try:
+            safe_title = quote(title, safe="")
+            resp = self.client.get(
+                f"{HW_BASE}/getStudentWork.do",
+                params={
+                    "course_id": self.course_id,
+                    "gradeBookPK": grade_book_pk,
+                    "title": safe_title,
+                    "showAll": "true",
+                },
+            )
+            resp.raise_for_status()
+            # Look for due date in various HTML patterns
+            html = resp.text
+            # Pattern 1: "截至时间" or "截止时间" followed by date
+            m = re.search(r'截至时间[：:]\s*<span[^>]*>([\d\-:\s]+)</span>', html)
+            if not m:
+                m = re.search(r'截止时间[：:]\s*<span[^>]*>([\d\-:\s]+)</span>', html)
+            if not m:
+                # Pattern 2: "Due:" in English interface
+                m = re.search(r'Due[：:]\s*<span[^>]*>([\d\-:\s]+)</span>', html, re.IGNORECASE)
+            if m:
+                raw = m.group(1).strip()
+                # Convert "2026-04-15 23:59:00" → "2026-04-15T23:59:00"
+                return raw.replace(" ", "T")
+        except Exception:
+            pass
+
+        return ""
 
     def fetch_submissions(
         self,

@@ -180,6 +180,36 @@ def _ensure_late_note(row_data: dict, notes: str) -> str:
     return late_line
 
 
+def _maybe_offer_full_score(
+    session: ReviewSession,
+    row_idx: int,
+    row_data: dict,
+    console: Console,
+) -> None:
+    """If notes are empty and score is not full, offer to override to full score."""
+    notes = str(row_data.get("reviewer_notes") or "").strip()
+    if notes:
+        return
+    total_max = float(row_data.get("total_max", 0) or 0)
+    if total_max <= 0:
+        return
+    current_override = row_data.get("reviewer_override_score")
+    override_val = float(current_override) if current_override not in (None, "") else None
+    if override_val is not None and abs(override_val - total_max) < 0.01:
+        return
+    total_score = float(row_data.get("total_score", 0) or 0)
+    if abs(total_score - total_max) < 0.01:
+        return
+    if Confirm.ask(
+        f"[bold cyan]Notes are empty. Override score to full ({total_max:.0f})?[/bold cyan]",
+        default=True,
+    ):
+        row_data["reviewer_override_score"] = total_max
+        session.ws.cell(row=row_idx, column=session.idx["reviewer_override_score"] + 1, value=total_max)
+        session.update_row(row_idx, row_data)
+        console.print(f"[green]Override score set to {total_max:.0f}. Use (a) to approve.[/green]")
+
+
 def _maybe_offer_override(
     session: ReviewSession,
     row_idx: int,
@@ -532,6 +562,8 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
         session.update_row(row_idx, row_data)
         console.print("[dim]Auto-appended late submission note.[/dim]")
 
+    _maybe_offer_full_score(session, row_idx, row_data, console)
+
 
 def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'notes text' action (T). Uses built-in multiline prompt (no editor)."""
@@ -555,6 +587,8 @@ def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, co
         session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=augmented)
         session.update_row(row_idx, row_data)
         console.print("[dim]Auto-appended late submission note.[/dim]")
+
+    _maybe_offer_full_score(session, row_idx, row_data, console)
 
 
 def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown: list, console: Console) -> list:

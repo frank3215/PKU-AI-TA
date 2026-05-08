@@ -424,11 +424,11 @@ def grade(
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
             # Resolve due date: CLI arg > REST API > skip late-check
-            due_dt_str = due_date or crawler.fetch_due_date(grade_book_pk)
+            due_dt_str = due_date or crawler.fetch_due_date(grade_book_pk, col_title)
             if due_dt_str:
                 console.print(f"  Due date: {due_dt_str}")
             else:
-                console.print("  [yellow]Warning: could not determine due date — late penalties disabled[/yellow]")
+                console.print("  [yellow]No due date set in Blackboard — late penalties disabled. Use --due-date to set one manually.[/yellow]")
 
             # Pass skip_ids and limit into fetch_submissions so only the
             # students we actually need are downloaded.
