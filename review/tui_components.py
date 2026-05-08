@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +91,120 @@ def prompt_text(prompt_label: str, default: str = "", console: Console | None = 
             break
         lines.append(line)
     return "\n".join(lines).strip() or default
+
+
+def edit_in_editor(initial_text: str = "", console: Console | None = None) -> str:
+    """Open an external text editor for multi-line input.
+
+    Priority:
+      1. config.editor (from .env)
+      2. $EDITOR environment variable
+      3. System fallback: nano, vim, vi, or notepad (Windows)
+
+    Falls back to prompt_text(..., multiline=True) if no editor is found
+    or the editor exits with an error.
+    """
+    import shutil
+    import tempfile
+
+    from config import settings
+
+    # Detect available editor (priority: config > $EDITOR > system fallback)
+    editor = settings.editor.strip()
+    if not editor:
+        editor = os.environ.get("EDITOR", "").strip()
+    if not editor:
+        for candidate in ("nano", "vim", "vi"):
+            if shutil.which(candidate):
+                editor = candidate
+                break
+        if not editor and sys.platform == "win32":
+            editor = "notepad"
+
+    if not editor:
+        raise RuntimeError("No text editor found (set EDITOR in .env or $EDITOR env var)")
+
+    # Write initial content to a temp file
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="pku_ta_notes_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(initial_text)
+
+        # Launch editor and wait
+        cmd = [editor, path]
+        # Handle editors passed as a single string with args (e.g. "code --wait")
+        if " " in editor and shutil.which(editor.split()[0]):
+            cmd = editor.split() + [path]
+
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(f"Editor exited with code {result.returncode}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _suggest_override_from_notes(notes: str, total_max: float) -> float | None:
+    """Extract deductions like '扣2分' from notes and compute an override score.
+
+    Returns the suggested score (total_max - sum_of_deductions) if any
+    deductions are found, otherwise None.
+    """
+    deductions = re.findall(r"扣\s*(\d+(?:\.\d+)?)\s*分", notes)
+    if not deductions:
+        return None
+    total_deduction = sum(float(d) for d in deductions)
+    return max(0.0, total_max - total_deduction)
+
+
+def _maybe_offer_override(
+    session: ReviewSession,
+    row_idx: int,
+    row_data: dict,
+    console: Console,
+    notes: str,
+) -> None:
+    """After notes are saved, scan for deductions and offer an override score."""
+    total_max = float(row_data.get("total_max", 100) or 100)
+    current_score = float(row_data.get("total_score", 0) or 0)
+    suggested = _suggest_override_from_notes(notes, total_max)
+    if suggested is None:
+        return
+
+    # Determine the effective current score (override takes precedence)
+    current_override = row_data.get("reviewer_override_score")
+    if current_override is not None and current_override != "":
+        try:
+            effective_score = float(current_override)
+        except (ValueError, TypeError):
+            effective_score = current_score
+    else:
+        effective_score = current_score
+
+    # If suggested score matches effective score, no need to override
+    if abs(suggested - effective_score) <= 0.01:
+        return
+
+    override_label = "update override" if (current_override is not None and current_override != "") else "set override"
+    console.print(
+        f"\n[dim]Detected {int(total_max - suggested)} point(s) of deductions in notes. "
+        f"Current score: {effective_score:.1f}, "
+        f"suggested: [bold cyan]{suggested:.1f}[/bold cyan][/dim]"
+    )
+    if Confirm.ask(f"[bold cyan]{override_label.capitalize()} score?[/bold cyan]", default=True):
+        row_data["reviewer_override_score"] = suggested
+        session.ws.cell(
+            row=row_idx,
+            column=session.idx["reviewer_override_score"] + 1,
+            value=suggested,
+        )
+        session.update_row(row_idx, row_data)
+        console.print(f"[green]Override score set to {suggested:.1f}. Use (a) to approve.[/green]")
 
 
 def prompt_choice(prompt_label: str, choices: list[str], default: str | None = None, console: Console | None = None) -> str:
@@ -190,6 +305,7 @@ def load_review_data(
     scores: Path,
     needs_review_only: bool,
     all_students: bool,
+    filter_ids: set[str] | None = None,
 ) -> tuple[Any, dict, list[tuple[int, dict]]]:
     """Load student data from scores spreadsheet and filter based on review status."""
     wb = openpyxl.load_workbook(scores)
@@ -203,6 +319,8 @@ def load_review_data(
         if not row[idx["student_id"]]:
             continue
         row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+        if filter_ids and str(row_data.get("student_id")) not in filter_ids:
+            continue
         if needs_review_only and row_data.get("needs_review") != "YES":
             continue
         # Skip approved students only if they don't need review for missing notes
@@ -210,7 +328,7 @@ def load_review_data(
         if not all_students and is_approved and not needs_review_check(row_data):
             continue
         rows.append((row_idx, row_data))
-    
+
     return wb, idx, rows
 
 def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
@@ -242,9 +360,9 @@ def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
 
 class ReviewSession:
     """Manages the state of an interactive review session."""
-    def __init__(self, scores: Path, needs_review_only: bool, all_students: bool):
+    def __init__(self, scores: Path, needs_review_only: bool, all_students: bool, filter_ids: set[str] | None = None):
         self.scores = scores
-        self.wb, self.idx, self.rows = load_review_data(scores, needs_review_only, all_students)
+        self.wb, self.idx, self.rows = load_review_data(scores, needs_review_only, all_students, filter_ids)
         self.ws = self.wb.active
         self.current_idx = 0
         self.modified_rows: dict[int, dict] = {}
@@ -297,6 +415,9 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
         console.print("\n[yellow]Score is not 100%. Please add reviewer notes.[/yellow]")
         current_notes = str(row_data.get("reviewer_notes") or "")
         try:
+            new_notes = edit_in_editor(initial_text=current_notes, console=console)
+        except RuntimeError:
+            # Fallback to built-in multiline prompt if no editor available
             new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
         except KeyboardInterrupt:
             console.print("\n[yellow]Approve cancelled.[/yellow]")
@@ -308,6 +429,39 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
             console.print("[green]Added reviewer notes.[/green]")
         else:
             console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
+
+    # Consistency check: breakdown sum must equal total score (unless overridden)
+    has_override = override_score is not None and override_score != ""
+    if not has_override:
+        import json
+        raw_bd = row_data.get("breakdown_json")
+        if raw_bd:
+            try:
+                breakdown = json.loads(raw_bd)
+                breakdown_sum = 0.0
+                for b in breakdown:
+                    pa = b.get("points_awarded")
+                    if pa is None:
+                        pa = 0.0
+                    breakdown_sum += float(pa)
+                total_score_raw = float(row_data.get("total_score", 0) or 0)
+                if abs(breakdown_sum - total_score_raw) > 0.01:
+                    console.print(
+                        f"\n[red]Score inconsistency detected:[/red] "
+                        f"breakdown sum = [yellow]{breakdown_sum:.1f}[/yellow], "
+                        f"total_score = [yellow]{total_score_raw:.1f}[/yellow] "
+                        f"(diff = [red]{breakdown_sum - total_score_raw:+.1f}[/red])"
+                    )
+                    console.print("[dim]Use [bold](ov) override[/bold] to set a manual score before approving.[/dim]")
+                    return False
+            except json.JSONDecodeError:
+                console.print("[red]Error: breakdown_json is malformed. Cannot verify score consistency.[/red]")
+                console.print("[dim]Use [bold](ov) override[/bold] to approve with a manual score, or (e)dit to fix breakdown.[/dim]")
+                return False
+            except (ValueError, TypeError) as e:
+                console.print(f"[red]Error: Invalid value in breakdown ({e}). Cannot verify score consistency.[/red]")
+                console.print("[dim]Use [bold](ov) override[/bold] to approve with a manual score.[/dim]")
+                return False
 
     # Ask before clearing reviewer notes for perfect scores
     if is_perfect and has_notes:
@@ -326,7 +480,30 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
     return True
 
 def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
-    """Handle the 'notes' action."""
+    """Handle the 'notes' action (n). Opens an external editor for multi-line input."""
+    current_notes = str(row_data.get("reviewer_notes") or "")
+    console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
+    try:
+        new_notes = edit_in_editor(initial_text=current_notes, console=console)
+    except RuntimeError:
+        # Fallback to built-in multiline prompt if no editor available
+        try:
+            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
+            return
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
+        return
+    row_data["reviewer_notes"] = new_notes
+    session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=new_notes)
+    session.update_row(row_idx, row_data)
+    console.print("[green]Updated reviewer notes.[/green]")
+    _maybe_offer_override(session, row_idx, row_data, console, new_notes)
+
+
+def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
+    """Handle the 'notes text' action (T). Uses built-in multiline prompt (no editor)."""
     current_notes = str(row_data.get("reviewer_notes") or "")
     console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
     try:
@@ -338,6 +515,7 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=new_notes)
     session.update_row(row_idx, row_data)
     console.print("[green]Updated reviewer notes.[/green]")
+    _maybe_offer_override(session, row_idx, row_data, console, new_notes)
 
 def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown: list, console: Console) -> list:
     """Handle the 'edit' action."""

@@ -130,7 +130,13 @@ class PKUHomeworkCrawler:
             return ""
 
     def fetch_submissions(
-        self, grade_book_pk: str, title: str, cache_dir: Path | None = None, verbose: bool = False
+        self,
+        grade_book_pk: str,
+        title: str,
+        cache_dir: Path | None = None,
+        verbose: bool = False,
+        skip_ids: set[str] | None = None,
+        limit: int = 0,
     ) -> list[Submission]:
         """
         Fetch student submissions for one assignment.
@@ -141,6 +147,11 @@ class PKUHomeworkCrawler:
 
         If *cache_dir* is provided, per-student mode will check for an existing
         local file before hitting the network.
+
+        *skip_ids* — student IDs to skip (e.g. already graded in a previous run).
+        *limit*    — maximum number of submissions to download (0 = no limit).
+                      Only students who are NOT already graded online and NOT in
+                      skip_ids count toward the limit.
         """
         self._ensure_bb_user_map()
 
@@ -164,9 +175,17 @@ class PKUHomeworkCrawler:
             return []
 
         if self.whitelist:
-            return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
+            return self._fetch_per_student(
+                students, grade_book_pk, title,
+                cache_dir=cache_dir, verbose=verbose,
+                skip_ids=skip_ids, limit=limit,
+            )
         else:
-            return self._fetch_batch_zip(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
+            return self._fetch_batch_zip(
+                students, grade_book_pk, title,
+                cache_dir=cache_dir, verbose=verbose,
+                skip_ids=skip_ids, limit=limit,
+            )
 
     # ------------------------------------------------------------------
     # Fetching strategies
@@ -175,6 +194,7 @@ class PKUHomeworkCrawler:
     def _fetch_per_student(
         self, students: list[dict], grade_book_pk: str, title: str,
         cache_dir: Path | None = None, verbose: bool = False,
+        skip_ids: set[str] | None = None, limit: int = 0,
     ) -> list[Submission]:
         """Download individual files via CheckWork.do + api/pdf.do.
 
@@ -182,12 +202,34 @@ class PKUHomeworkCrawler:
         the local copy is used instead of hitting the network.
         """
         import re
+        import sys
 
         submissions: list[Submission] = []
+        skip_reasons: dict[str, int] = {
+            "not_in_whitelist": 0,
+            "in_skip_ids": 0,
+            "already_graded": 0,
+            "download_failed": 0,
+            "no_file_found": 0,
+            "limit_reached": 0,
+        }
+
         for student in students:
             student_id = student["userId"]
             if student_id not in self.whitelist:
+                skip_reasons["not_in_whitelist"] += 1
                 continue
+            if skip_ids and student_id in skip_ids:
+                skip_reasons["in_skip_ids"] += 1
+                continue
+            if student.get("already_graded", False):
+                skip_reasons["already_graded"] += 1
+                continue
+            if limit > 0 and len(submissions) >= limit:
+                skip_reasons["limit_reached"] += 1
+                if verbose:
+                    print(f"  ! Reached download limit ({limit}), skipping remaining students")
+                break
 
             # Try local cache first (skip if student has multiple attempts —
             # cached file may be an older version)
@@ -218,10 +260,12 @@ class PKUHomeworkCrawler:
                         attempt_pk=student["attemptPk"],
                     )
                 except Exception as e:
+                    skip_reasons["download_failed"] += 1
                     if verbose:
                         print(f"  ✗ Download failed {student_id} {student['name']}: {e}")
                     continue
                 if file_bytes is None:
+                    skip_reasons["no_file_found"] += 1
                     if verbose:
                         print(f"  ! No file found {student_id} {student['name']}")
                     continue
@@ -237,14 +281,25 @@ class PKUHomeworkCrawler:
                 bb_user_id=self._bb_user_map.get(student_id, ""),
                 attachments=[Attachment(filename=filename, content_type=content_type, data=file_bytes)],
                 submitted_at=student.get("submitted_at", ""),
-                already_graded=student.get("already_graded", False),
+                already_graded=False,
                 has_multiple_attempts=student.get("has_multiple_attempts", False),
             ))
+
+        total_skipped = sum(skip_reasons.values())
+        if total_skipped > 0:
+            parts = [f"{k.replace('_', ' ')}={v}" for k, v in skip_reasons.items() if v > 0]
+            print(
+                f"  [fetch] {len(students)} students → {len(submissions)} downloaded, "
+                f"{total_skipped} skipped ({', '.join(parts)})",
+                file=sys.stderr,
+            )
+
         return submissions
 
     def _fetch_batch_zip(
         self, students: list[dict], grade_book_pk: str, title: str,
         cache_dir: Path | None = None, verbose: bool = False,
+        skip_ids: set[str] | None = None, limit: int = 0,
     ) -> list[Submission]:
         """Download all files at once via downloadBatch.do ZIP.
 
@@ -273,6 +328,12 @@ class PKUHomeworkCrawler:
             submissions: list[Submission] = []
             for student, (filename, file_bytes) in zip(students, zip_files):
                 student_id = student["userId"]
+                if skip_ids and student_id in skip_ids:
+                    continue
+                if student.get("already_graded", False):
+                    continue
+                if limit > 0 and len(submissions) >= limit:
+                    break
                 submissions.append(Submission(
                     student_id=student_id,
                     student_name=student["name"],
@@ -285,7 +346,7 @@ class PKUHomeworkCrawler:
                         data=file_bytes,
                     )],
                     submitted_at=student.get("submitted_at", ""),
-                    already_graded=student.get("already_graded", False),
+                    already_graded=False,
                 ))
             return submissions
         except (RuntimeError, zipfile.BadZipFile, Exception) as e:
@@ -296,7 +357,11 @@ class PKUHomeworkCrawler:
             original_whitelist = self.whitelist
             self.whitelist = {s["userId"] for s in students}
             try:
-                return self._fetch_per_student(students, grade_book_pk, title, cache_dir=cache_dir, verbose=verbose)
+                return self._fetch_per_student(
+                    students, grade_book_pk, title,
+                    cache_dir=cache_dir, verbose=verbose,
+                    skip_ids=skip_ids, limit=limit,
+                )
             finally:
                 self.whitelist = original_whitelist
 

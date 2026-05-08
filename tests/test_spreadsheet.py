@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from models import CriterionScore, ReviewRecord, ScoringResult, UncertainPart
-from review.spreadsheet import export, load_reviewed
+from review.spreadsheet import export, export_append, load_reviewed
 
 
 def make_result(student_id="2100012345", needs_review=False, confidence=0.9) -> ScoringResult:
@@ -113,3 +113,60 @@ class TestSpreadsheetRoundtrip:
             assert records[0].result.breakdown[0].criterion == "Correctness"
             assert len(records[0].result.uncertain_parts) == 1
             assert records[0].result.uncertain_parts[0].description == "Unclear"
+
+
+class TestExportAppend:
+    def test_creates_new_file_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scores.xlsx"
+            export_append([make_result("2100012345")], path)
+            assert path.exists()
+            records = load_reviewed(path)
+            assert len(records) == 1
+            assert records[0].result.student_id == "2100012345"
+
+    def test_appends_to_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scores.xlsx"
+            export([make_result("2100012345")], path)
+            export_append([make_result("2100012346")], path)
+
+            records = load_reviewed(path)
+            assert len(records) == 2
+            assert records[0].result.student_id == "2100012345"
+            assert records[1].result.student_id == "2100012346"
+
+    def test_preserves_existing_approved_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scores.xlsx"
+            export([make_result("2100012345")], path)
+
+            import openpyxl
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            ws.cell(2, headers.index("approved") + 1).value = "YES"
+            ws.cell(2, headers.index("reviewer_notes") + 1).value = "Looks good"
+            wb.save(path)
+
+            export_append([make_result("2100012346")], path)
+            records = load_reviewed(path)
+            assert len(records) == 2
+            assert records[0].approved is True
+            assert records[0].reviewer_notes == "Looks good"
+            assert records[1].approved is False
+
+    def test_appended_needs_review_highlighted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scores.xlsx"
+            export([make_result("2100012345", needs_review=False)], path)
+            export_append([make_result("2100012346", needs_review=True)], path)
+
+            import openpyxl
+            from openpyxl.styles import PatternFill
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            # Row 3 (appended) should have yellow fill
+            fill = ws.cell(3, 1).fill
+            assert fill.start_color.rgb in ("FFFFFF99", "FFFF99", "00FFFF99")

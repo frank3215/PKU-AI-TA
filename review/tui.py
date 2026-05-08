@@ -29,6 +29,7 @@ from review.tui_components import (
     handle_approve,
     handle_edit,
     handle_notes,
+    handle_notes_prompt,
     handle_override,
 )
 
@@ -62,6 +63,25 @@ def display_student(console: Console, row_data: dict, row_idx: int, total: int, 
         info_table.add_row("Score:", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
 
     info_table.add_row("Confidence:", f"{row_data['confidence']}")
+    processing_notes = str(row_data.get("processing_notes") or "")
+    if processing_notes:
+        mode_color = "cyan" if processing_notes == "text" else "magenta"
+        info_table.add_row("Processing mode:", f"[{mode_color}]{processing_notes}[/{mode_color}]")
+
+    # Consistency check: breakdown sum vs total_score
+    consistency_msg = ""
+    try:
+        bd_check = json.loads(row_data.get("breakdown_json", "[]") or "[]") if row_data.get("breakdown_json") else []
+        if bd_check:
+            bd_sum = sum(float(b.get("points_awarded", 0) or 0) for b in bd_check)
+            total_raw = float(row_data.get("total_score", 0) or 0)
+            if abs(bd_sum - total_raw) > 0.01:
+                consistency_msg = f"[red]INCONSISTENT: breakdown sum = {bd_sum:.1f}, total = {total_raw:.1f}[/red]"
+    except (json.JSONDecodeError, ValueError, TypeError):
+        consistency_msg = "[yellow]Warning: Could not verify score consistency[/yellow]"
+    if consistency_msg:
+        info_table.add_row("Consistency:", consistency_msg)
+
     info_table.add_row("Needs review:", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
     info_table.add_row("Current approved:", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
     current_notes = str(row_data.get("reviewer_notes") or "")
@@ -138,6 +158,7 @@ def run_review_tui(
     needs_review_only: bool = False,
     all_students: bool = False,
     auto_approve: bool = False,
+    filter_ids: set[str] | None = None,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one."""
     if not scores.exists():
@@ -150,7 +171,7 @@ def run_review_tui(
         console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
 
     console.print(f"Loading spreadsheet: {scores}")
-    session = ReviewSession(scores, needs_review_only, all_students)
+    session = ReviewSession(scores, needs_review_only, all_students, filter_ids)
 
     if not session.rows:
         console.print("[yellow]No students to review with the current filters.[/yellow]")
@@ -192,12 +213,12 @@ def run_review_tui(
                 console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
             console.print()
 
-            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
+            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes→editor (T)ext→prompt (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,
@@ -216,6 +237,8 @@ def run_review_tui(
                     session.next_student()
             elif action in ("n", "notes"):
                 handle_notes(session, row_idx, row_data, console)
+            elif action == "T":
+                handle_notes_prompt(session, row_idx, row_data, console)
             elif action in ("e", "edit"):
                 breakdown = handle_edit(session, row_idx, row_data, breakdown, console)
             elif action in ("o", "open") and sub_file:

@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     # Comma-separated student ID whitelist; empty = all students
     student_whitelist: str = ""
 
+    # DashScope API key for qwen benchmark
+    dashscope_api_key: str = ""
+
+    # Auto-submit approved scores after grading (equivalent to --auto-submit)
+    auto_submit: bool = False
+
+    # Default text editor for multi-line input in the review TUI.
+    # Falls back to $EDITOR environment variable if not set.
+    editor: str = "vim"
+
     @property
     def whitelist_ids(self) -> set[str]:
         if not self.student_whitelist.strip():

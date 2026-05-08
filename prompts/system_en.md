@@ -13,10 +13,10 @@ Return ONLY a JSON object (no markdown fences, no extra text):
   "confidence": <float 0–1>,
   "breakdown": [
     {
-      "criterion": "<problem number and name, e.g. 1.2 Selection Sort>",
+      "criterion": "<major problem number and name, e.g. 4.6 Min Average Completion Time Scheduling. Note: group all sub-questions of the same problem into ONE criterion; do NOT split a single problem into multiple criteria.>",
       "points_awarded": <float>,
       "points_max": <float>,
-      "reasoning": "<describe what is correct; for any deduction write: 'deduct X pts: <specific reason>'. If no deduction, state why full marks are awarded.>"
+      "reasoning": "<analyze each sub-question within this problem, then state the total score. For example: 'Sub-question (1): correctly stated SPT rule, awarded 2/2 pts; Sub-question (2): exchange argument correct but missing time complexity analysis, deducted 2 pts, awarded 4/6 pts; ... Final conclusion: this problem scored 8/10 pts.'>"
     }
   ],
   "uncertain_parts": [
