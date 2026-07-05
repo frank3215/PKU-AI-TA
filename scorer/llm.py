@@ -462,7 +462,7 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
     data: dict | None = None
     used_model = settings.ta_model
     raw = ""
-    fallback_models = ["MiniMax-M2.7"]  # fallback if primary model fails
+    fallback_models = [settings.fallback_model]  # fallback if primary model fails
 
     # Try primary model first, fall back on failure
     for attempt, model in enumerate([settings.ta_model] + fallback_models):

@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # When True, uncertain parts are prepopulated into reviewer notes on first edit
     append_uncertain_to_notes: bool = False
 
+    # Fallback model when the primary model fails/timeouts
+    fallback_model: str = "MiniMax-M2.7"
+
     # Default text editor for multi-line input in the review TUI.
     # Falls back to $EDITOR environment variable if not set.
     editor: str = "vim"
