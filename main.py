@@ -872,6 +872,7 @@ def review(
     needs_review_only: Annotated[bool, typer.Option("--needs-review", "-n", help="Only review students marked needs_review=YES")] = False,
     all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
     auto_approve: Annotated[bool, typer.Option("--auto-approve", help="Auto-approve 100-point submissions that don't need review")] = False,
+    auto_skip_late: Annotated[bool, typer.Option("--auto-skip-late", help="Auto-skip students with >7d late submission (score set to 0)")] = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
@@ -893,6 +894,7 @@ def review(
             all_students=all_students,
             auto_approve=auto_approve,
             append_uncertain=_settings.append_uncertain_to_notes,
+            auto_skip_late=auto_skip_late,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")

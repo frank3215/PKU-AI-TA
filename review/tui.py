@@ -178,6 +178,7 @@ def run_review_tui(
     auto_approve: bool = False,
     filter_ids: set[str] | None = None,
     append_uncertain: bool = False,
+    auto_skip_late: bool = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one."""
     if not scores.exists():
@@ -204,6 +205,23 @@ def run_review_tui(
             session.wb.save(scores)
             session = ReviewSession(scores, needs_review_only, all_students, append_uncertain=append_uncertain)
             console.print(f"[green]{len(session.rows)} student(s) remaining to review after auto-approve.[/green]")
+
+    if auto_skip_late:
+        skipped = 0
+        remaining_rows = []
+        for row_idx, row_data in session.rows:
+            late_days = float(row_data.get("late_days") or 0)
+            if late_days > 7:
+                name = row_data.get("student_name", "?")
+                sid = row_data.get("student_id", "?")
+                console.print(f"  [dim]Auto-skipping {name} ({sid}) — late {late_days:.0f}d >7d limit[/dim]")
+                skipped += 1
+            else:
+                remaining_rows.append((row_idx, row_data))
+        if skipped:
+            session.rows = remaining_rows
+            session.current_idx = 0
+            console.print(f"[yellow]Skipped {skipped} student(s) due to >7d late submission.[/yellow]")
 
     try:
         _skip_display = False
@@ -247,7 +265,7 @@ def run_review_tui(
                 console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (n)otes (o)pen (r)ubric [yellow](u)[/yellow]ncert. [yellow]R[/yellow] query [yellow]j[/yellow] name (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (n)otes (o)pen (r)ubric (u)ncert. (R)ecall (j)ump (b)ack (q)uit[/dim]",
                 default="skip",
             )
 
