@@ -208,11 +208,13 @@ def run_review_tui(
     try:
         _skip_display = False
         while True:
-            current_row = session.get_current_row()
-            if current_row is None:
-                break
-
-            row_idx, row_data = current_row
+            if session._jump_row_data is not None:
+                row_idx, row_data = -1, session._jump_row_data
+            else:
+                current_row = session.get_current_row()
+                if current_row is None:
+                    break
+                row_idx, row_data = current_row
             i = session.current_idx + 1
 
             try:
@@ -221,7 +223,10 @@ def run_review_tui(
                 breakdown = []
 
             if not _skip_display:
-                display_student(console, row_data, i, len(session.rows), breakdown)
+                if session._jump_row_data is not None:
+                    display_student(console, row_data, "ext", len(session.rows), breakdown)
+                else:
+                    display_student(console, row_data, i, len(session.rows), breakdown)
             _skip_display = False
 
             student_id = str(row_data["student_id"])
@@ -264,6 +269,12 @@ def run_review_tui(
                     query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]").strip()
                 if query:
                     handle_jump(session, query, console)
+                continue
+
+            # External jump state: only allow read-only actions (o, r, R, j, u, q)
+            if session._jump_row_data is not None and action not in ("q", "quit", "o", "open", "r", "rubric", "u"):
+                session._jump_row_data = None
+                console.print("[dim]Returned to review queue.[/dim]")
                 continue
 
             if action in ("q", "quit"):

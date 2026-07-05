@@ -445,8 +445,9 @@ class ReviewSession:
         self.current_idx = 0
         self.modified_rows: dict[int, dict] = {}
         self.modified = False
-        # When True, prepopulate uncertain parts into notes on first edit
         self.append_uncertain_to_notes = append_uncertain
+        # Set by handle_jump when jumping to a student outside the review queue
+        self._jump_row_data: dict | None = None
 
         # Infer assignment_id from the first row of the spreadsheet so we can
         # locate the correct submission directory.
@@ -674,12 +675,11 @@ def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
     headers = [str(c.value or "") for c in header_row]
     col_idx = {name: i for i, name in enumerate(headers)}
 
-    approved_col = col_idx.get("approved")
     notes_col = col_idx.get("reviewer_notes")
     sid_col = col_idx.get("student_id")
     name_col = col_idx.get("student_name")
 
-    if any(c is None for c in (approved_col, notes_col, sid_col, name_col)):
+    if any(c is None for c in (notes_col, sid_col, name_col)):
         console.print("[red]Required columns not found in spreadsheet.[/red]")
         return
 
@@ -688,9 +688,6 @@ def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
 
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or not row[sid_col]:
-            continue
-        approved = str(row[approved_col] or "").upper() == "YES"
-        if not approved:
             continue
         sid = str(row[sid_col] or "").strip()
         sname = str(row[name_col] or "").strip()
@@ -732,15 +729,33 @@ def handle_override(session: ReviewSession, row_idx: int, row_data: dict, consol
 
 
 def handle_jump(session: ReviewSession, query: str, console: Console) -> bool:
-    """Jump to a student matching name or ID. Returns True if found."""
+    """Jump to a student matching name or ID. Searches entire worksheet."""
     q = query.strip().lower()
+    # First try the current queue
     for i, (row_idx, row_data) in enumerate(session.rows):
         sid = str(row_data.get("student_id", "") or "").lower()
         sname = str(row_data.get("student_name", "") or "").lower()
         if q in sid or q in sname:
+            session._jump_row_data = None  # clear any external jump
             session.current_idx = i
             console.print(f"[green]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}).[/green]")
             return True
+
+    # Not in queue → search entire worksheet
+    ws = session.ws
+    headers = [str(c.value or "") for c in ws[1]]
+    col_idx = {name: i for i, name in enumerate(headers)}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row:
+            continue
+        sid = str(row[col_idx.get("student_id", 0)] or "").lower()
+        sname = str(row[col_idx.get("student_name", 1)] or "").lower()
+        if q in sid or q in sname:
+            row_data = {name: row[i] if i < len(row) else None for name, i in col_idx.items()}
+            session._jump_row_data = row_data
+            console.print(f"[yellow]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}) [outside review queue].[/yellow]")
+            return True
+
     console.print(f"[yellow]No student matching '{query}' found.[/yellow]")
     return False
 
