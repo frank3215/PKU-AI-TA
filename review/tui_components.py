@@ -645,6 +645,59 @@ def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown:
     console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
     return breakdown
 
+def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
+    """Search approved students' reviewer_notes for lines matching query.
+
+    Outputs in format: 学号_学生名: matching line
+    """
+    import re as _re
+
+    ws = session.ws
+    idx = session.idx
+    header_row = list(ws.iter_rows(min_row=1, max_row=1))[0]
+    headers = [str(c.value or "") for c in header_row]
+    col_idx = {name: i for i, name in enumerate(headers)}
+
+    approved_col = col_idx.get("approved")
+    notes_col = col_idx.get("reviewer_notes")
+    sid_col = col_idx.get("student_id")
+    name_col = col_idx.get("student_name")
+
+    if any(c is None for c in (approved_col, notes_col, sid_col, name_col)):
+        console.print("[red]Required columns not found in spreadsheet.[/red]")
+        return
+
+    pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
+    results: list[str] = []
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not row[sid_col]:
+            continue
+        approved = str(row[approved_col] or "").upper() == "YES"
+        if not approved:
+            continue
+        sid = str(row[sid_col] or "").strip()
+        sname = str(row[name_col] or "").strip()
+        notes = str(row[notes_col] or "")
+        if not notes:
+            continue
+
+        for line in notes.split("\n"):
+            line = line.strip()
+            if line and pattern.search(line):
+                results.append(f"{sid}_{sname}: {line}")
+
+    if results:
+        from rich.table import Table as RichTable
+        t = RichTable(title=f"Recall: '{query}' ({len(results)} match(es))", box=None, expand=True)
+        t.add_column("Match", overflow="fold")
+        for r in results:
+            t.add_row(r)
+        console.print(t)
+    else:
+        console.print(f"[yellow]No matches for '{query}' in approved records.[/yellow]")
+
+
 def handle_override(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'override' action. Sets override score and stays on current student."""
     current_override = row_data.get("reviewer_override_score", "")
