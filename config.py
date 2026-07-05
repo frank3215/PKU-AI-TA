@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Number of parallel LLM scoring threads
     ta_threads: int = 4
 
+    # Timeout per LLM call in seconds (0 = no timeout).  M3's thinking can loop.
+    llm_timeout: int = 0
+
     # Confidence threshold below which a result is flagged for human review
     review_threshold: float = 0.75
 

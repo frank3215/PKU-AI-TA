@@ -8,7 +8,9 @@ Commands:
 """
 from __future__ import annotations
 
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import threading
 from pathlib import Path
 from typing import Annotated, Optional
@@ -24,6 +26,13 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn
 
 app = typer.Typer(help="PKU AI Teaching Assistant")
 console = Console()
+
+# Configure logging — default to WARNING, use --log-file for detailed debug output
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s %(name)s %(message)s",
+    stream=sys.stderr,
+)
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
@@ -205,6 +214,7 @@ def grade(
     column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
     rubric: Annotated[Path, typer.Option(help="Path to rubric file (any format the LLM supports)")] = Path("rubric.md"),
     whitelist: Annotated[str, typer.Option(help="Comma-separated student IDs to include; empty = all")] = "",
+    student_list: Annotated[Optional[Path], typer.Option(help="File with one student ID per line (alternative to --whitelist)")] = None,
     out: Annotated[Path, typer.Option(help="Output Excel path")] = Path("scores.xlsx"),
     save_dir: Annotated[Optional[Path], typer.Option(help="Save submission files here for human review; default: submissions/")] = Path("submissions"),
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
@@ -216,6 +226,7 @@ def grade(
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Interactively prompt for missing parameters")] = False,
     auto_submit: Annotated[bool, typer.Option("--auto-submit", help="After grading, automatically submit any already-approved scores")] = False,
     limit: Annotated[int, typer.Option(help="Only grade the first N submissions (useful for testing or batching); 0 = no limit")] = 0,
+    log_file: Annotated[Path, typer.Option(help="Write detailed logs to file (includes debug output from LLM calls)")] = Path("grade.log"),
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -242,6 +253,14 @@ def grade(
     from scorer.llm import score_submission
     from submitter.blackboard import submit_scores
     from models import CriterionScore, ScoringResult
+
+    # Configure logging to file (always on — default grade.log)
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    logging.getLogger("pku_ai_ta.scorer").setLevel(logging.DEBUG)
+    console.print(f"  [dim]Logging to {log_file} (DEBUG level)[/dim]")
 
     # Override thread count from CLI if explicitly set
     if threads > 0:
@@ -385,15 +404,21 @@ def grade(
 
     # Determine whitelist:
     # - If --regrade-unapproved: only regrade unapproved students
-    # - Else: use CLI whitelist or settings whitelist
+    # - Else: use CLI --whitelist, --student-list file, or settings whitelist
     if regrade_unapproved and unapproved_student_ids:
         whitelist_ids: set[str] = unapproved_student_ids
     else:
-        whitelist_ids: set[str] = (
-            {s.strip() for s in whitelist.split(",") if s.strip()}
-            if whitelist
-            else settings.whitelist_ids
-        )
+        if student_list:
+            if not student_list.exists():
+                console.print(f"[red]Error:[/red] Student list file not found: {student_list}")
+                raise typer.Exit(1)
+            content = student_list.read_text(encoding="utf-8")
+            whitelist_ids = {line.strip() for line in content.splitlines() if line.strip()}
+            console.print(f"  [dim]Loaded {len(whitelist_ids)} student(s) from {student_list}[/dim]")
+        elif whitelist:
+            whitelist_ids = {s.strip() for s in whitelist.split(",") if s.strip()}
+        else:
+            whitelist_ids = settings.whitelist_ids
 
     if not rubric.exists():
         console.print(f"[red]Error:[/red] Rubric file not found: {rubric}")
@@ -473,7 +498,7 @@ def grade(
                 futures: dict = {}
                 executor = DaemonThreadPoolExecutor(max_workers=settings.ta_threads)
                 try:
-                    futures = {executor.submit(score_submission, sub, rubric_text, prompt): sub for sub in submissions}
+                    futures = {executor.submit(score_submission, sub, rubric_text, prompt, settings.llm_timeout): sub for sub in submissions}
                     for future in as_completed(futures):
                         sub = futures[future]
                         try:
@@ -745,17 +770,20 @@ def review(
 def _apply_late_penalty(result, submission, due_dt_str: str, console) -> None:
     """Apply 10-point late penalty if submission is ≤7 days late."""
     from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
 
     if not due_dt_str or not submission.submitted_at:
         return
 
     try:
-        # Parse due date (ISO 8601 with Z or +00:00)
+        # Parse due date — ISO 8601 with Z/+00:00 → UTC; naive → assume Beijing time
         due_str = due_dt_str.replace("Z", "+00:00")
         due_dt = datetime.fromisoformat(due_str)
-        # Parse submitted_at (local time, treat as UTC for comparison)
+        if due_dt.tzinfo is None:
+            due_dt = due_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        # Parse submitted_at — Blackboard returns Beijing time (CST, UTC+8)
         sub_dt = datetime.strptime(submission.submitted_at, "%Y-%m-%d %H:%M:%S")
-        sub_dt = sub_dt.replace(tzinfo=timezone.utc)
+        sub_dt = sub_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
 
         delta = sub_dt - due_dt
         late_days = delta.total_seconds() / 86400
@@ -1001,7 +1029,7 @@ def batch(
             task = progress.add_task("  Grading", total=len(current_batch))
             executor = ThreadPoolExecutor(max_workers=settings.ta_threads)
             try:
-                futures = {executor.submit(score_submission, sub, rubric_text, prompt): sub for sub in current_batch}
+                futures = {executor.submit(score_submission, sub, rubric_text, prompt, settings.llm_timeout): sub for sub in current_batch}
                 for future in as_completed(futures):
                     sub = futures[future]
                     try:

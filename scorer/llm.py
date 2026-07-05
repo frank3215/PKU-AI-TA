@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -91,20 +92,42 @@ def get_system_prompt(path: Path) -> str:
 # Attachment handling
 # ---------------------------------------------------------------------------
 
+def _extract_pdf_mupdf(data: bytes) -> str:
+    """Extract text using pymupdf (fitz)."""
+    import fitz
+    doc = fitz.open(stream=data, filetype="pdf")
+    pages = [page.get_text() for page in doc]
+    doc.close()
+    return "\n\n".join(pages)
+
+
+def _extract_pdf_pypdf(data: bytes) -> str:
+    """Extract text using pypdf (fallback)."""
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n\n".join(pages)
+
+
 def _extract_text(attachment: Attachment) -> str:
     """Extract text from a PDF, Word doc, or plain-text file."""
     data = attachment.data
     fname = attachment.filename.lower()
 
     if data[:4] == b'%PDF' or fname.endswith('.pdf'):
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            pages = [page.extract_text() or "" for page in reader.pages]
-            text = "\n\n".join(pages).strip()
-            return text if text else "(PDF has no extractable text — may be scanned/image-only)"
-        except Exception as e:
-            return f"(Could not extract text from PDF: {e})"
+        # Try pymupdf first (better font/CMap handling), fall back to pypdf
+        text_extractors = [
+            ("pymupdf", lambda d: _extract_pdf_mupdf(d)),
+            ("pypdf", lambda d: _extract_pdf_pypdf(d)),
+        ]
+        for name, fn in text_extractors:
+            try:
+                text = fn(data)
+                if text.strip():
+                    return text.strip()
+            except Exception:
+                continue
+        return "(PDF has no extractable text — may be scanned/image-only)"
 
     if data[:2] == b'PK' or fname.endswith(('.docx', '.doc')):
         try:
@@ -153,18 +176,36 @@ def _text_looks_garbled(text: str) -> bool:
     if control_count > len(text) * 0.01:
         return True
 
-    # Signal 2: 3+ letter Latin sequences with no vowels (OCR garbage like "ftityi")
-    # y/Y counts as vowel to avoid false positives (fly, python, etc.)
-    vowels = set('aeiouyAEIOUY')
-    garbage_count = 0
-    for match in re.finditer(r'[a-zA-Z]{3,}', text):
-        seq = match.group()
-        if not any(c in vowels for c in seq):
-            garbage_count += 1
-    if garbage_count >= 3:  # 3+ such sequences = likely garbled OCR
-        return True
+    # Signal 2: check word-like tokens. OCR gibberish produces very short
+    # "words" with low vowel ratio, while real English has longer vowel-rich tokens.
+    tokens = [t for t in re.split(r'\s+', text) if re.search(r'[a-zA-Z]', t)]
+    if len(tokens) >= 10:
+        avg_len = sum(len(t) for t in tokens) / len(tokens)
+        # OCR gibberish: avg length < 3.5 (e.g. "Ed", "Kij", "flig")
+        # Real English: avg length ~4.5-5.5
+        if avg_len < 3.8:
+            vowelled = sum(1 for t in tokens if any(
+                c.lower() in 'aeiouy' for c in t if c.isalpha()
+            ))
+            if vowelled / len(tokens) < 0.5:
+                return True
 
-    # Signal 3: Replacement characters indicating encoding failure
+    # Signal 3: vowelless Latin sequences (OCR garbage like "ftityi")
+    # Skip this check for texts with reasonable CJK content — they're legit.
+    # Algorithm acronyms (SSP, SPF, BFS etc.) can cause false positives.
+    cjk = sum(1 for ch in text if '一' <= ch <= '鿿')
+    if cjk / max(len(text), 1) < 0.02:
+        # y/Y counts as vowel to avoid false positives (fly, python, etc.)
+        vowels = set('aeiouyAEIOUY')
+        garbage_count = 0
+        for match in re.finditer(r'[a-zA-Z]{3,}', text):
+            seq = match.group()
+            if not any(c in vowels for c in seq):
+                garbage_count += 1
+        if garbage_count >= 8:  # real OCR garbage has many, not just a few acronyms
+            return True
+
+    # Signal 4: Replacement characters indicating encoding failure
     if text.count('�') > len(text) * 0.005:
         return True
 
@@ -188,9 +229,18 @@ def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     # Detect garbled OCR text: PDF text layer exists but is unreadable.
     # For Chinese homework, a long text with almost no CJK characters is
     # a strong signal of corrupted OCR / bad text extraction.
+    # Exception: if text has English/algorithmic content (Latin + math symbols),
+    # it's likely a legitimate English submission (e.g. international students).
     cjk_count = sum(1 for ch in stripped if '\u4e00' <= ch <= '\u9fff')
-    if len(stripped) > 200 and cjk_count / len(stripped) < 0.02:
+    # Zero CJK in a PDF from a Chinese course \u2192 handwriting OCR that produced no
+    # recognizable Chinese characters. Vision is the only reliable option.
+    if cjk_count == 0 and attachment and attachment.filename.lower().endswith('.pdf'):
         return True
+    if len(stripped) > 200 and cjk_count / len(stripped) < 0.02:
+        # Check for English content: >30% Latin letters + digits \u2192 genuine English
+        latin = sum(1 for ch in stripped if ch.isascii() and ch.isalpha())
+        if latin / max(len(stripped), 1) < 0.3:
+            return True
 
     # NEW: Detect text that looks like bad OCR from handwritten PDFs
     # (e.g. vector pen strokes not detected as images by _pdf_has_embedded_images)
@@ -291,44 +341,59 @@ def _to_anthropic_content(parts: list[dict]) -> list[dict]:
 # LLM call helpers
 # ---------------------------------------------------------------------------
 
-def _call_openai(system_prompt: str, content_parts: list[dict]) -> str:
+def _call_openai(system_prompt: str, content_parts: list[dict], timeout: int = 0, model: str = "") -> str:
     """Call OpenAI-compatible API and return raw text response."""
     client = _get_openai_client()
+    active_model = model or settings.ta_model
+    model_name = active_model.lower()
     extra: dict = {}
     if not settings.enable_thinking:
-        model_name = settings.ta_model.lower()
         if "qwen" in model_name and ("openrouter" in settings.openai_base_url or "dashscope" in settings.openai_base_url):
             extra["extra_body"] = {"enable_thinking": False}
+        elif "minimax" in model_name:
+            extra["extra_body"] = {"enable_thinking": False}
 
-    response = client.chat.completions.create(
-        model=settings.ta_model,
-        messages=[
+    kwargs = {
+        "model": active_model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content_parts},
         ],
-        temperature=0.2,
+        "temperature": 0,
+        "max_tokens": 65536,
         **extra,
-    )
+    }
+
+    if timeout > 0:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(client.chat.completions.create, **kwargs)
+            try:
+                response = future.result(timeout=timeout)
+            except FutureTimeout:
+                raise TimeoutError(f"LLM call timed out after {timeout}s")
+    else:
+        response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content or ""
 
 
-def _call_anthropic(system_prompt: str, content_parts: list[dict]) -> str:
+def _call_anthropic(system_prompt: str, content_parts: list[dict], timeout: int = 0) -> str:
     """Call Anthropic Messages API and return raw text response."""
     client = _get_anthropic_client()
     ac = _to_anthropic_content(content_parts)
     kwargs: dict = {
         "model": settings.ta_model,
-        "max_tokens": 16384,
+        "max_tokens": 65536,
         "system": system_prompt,
         "messages": [{"role": "user", "content": ac}],
     }
     if settings.enable_thinking:
-        # Anthropic extended thinking mode (Claude 3.7+)
-        # Note: thinking mode requires temperature=1
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
         kwargs["temperature"] = 1.0
     else:
         kwargs["temperature"] = 0.2
+    if timeout > 0:
+        kwargs["timeout"] = timeout
     response = client.messages.create(**kwargs)
     # Anthropic returns content blocks; collect text blocks (skipping thinking blocks)
     text_parts: list[str] = []
@@ -345,7 +410,7 @@ def _call_anthropic(system_prompt: str, content_parts: list[dict]) -> str:
 # Main scoring function
 # ---------------------------------------------------------------------------
 
-def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAULT_PROMPT) -> ScoringResult:
+def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAULT_PROMPT, llm_timeout: int = 0) -> ScoringResult:
     """Score a single submission against the rubric using the LLM."""
     system_prompt = get_system_prompt(prompt)
 
@@ -370,15 +435,54 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
         else (_processing_modes[0] if _processing_modes else "text")
     )
 
+    # When vision mode is active, inject anti-loop guard into user message.
+    # Handwriting re-reading causes unstable text interpretation -> model loops.
+    if "vision" in processing_notes:
+        content[0]["text"] = (
+            "CRITICAL: Do NOT output <think> or <thinking> tags. Output raw JSON only.\n"
+            "1. If handwriting is unclear -> mark uncertain_parts, do NOT re-read. Human will check.\n"
+            "2. If torn between deducting 2 vs 3 points -> choose 2 (lenient), mark uncertain_parts, move on.\n"
+            "3. Equivalent expression = full marks. Do not debate whether student notation is standard.\n"
+            "4. Each problem: judge ONCE. First judgment = final judgment.\n"
+            "5. Output raw JSON directly. If you catch yourself writing analysis instead of JSON, stop and output JSON.\n\n"
+            + content[0]["text"]
+        )
+
     start = time.time()
     provider = settings.llm_provider.lower()
-    if provider == "anthropic":
-        raw = _call_anthropic(system_prompt, content)
-    else:
-        raw = _call_openai(system_prompt, content)
-    elapsed = time.time() - start
+    data: dict | None = None
+    used_model = settings.ta_model
+    raw = ""
+    fallback_models = ["MiniMax-M2.7"]  # fallback if primary model fails
 
-    data = _parse_json(raw)
+    # Try primary model first, fall back on failure
+    for attempt, model in enumerate([settings.ta_model] + fallback_models):
+        if attempt > 0:
+            logger.warning(
+                "Fallback: retrying %s %s with %s after primary model failed",
+                submission.student_id, submission.student_name, model,
+            )
+        try:
+            if provider == "anthropic":
+                raw = _call_anthropic(system_prompt, content, llm_timeout)
+            else:
+                raw = _call_openai(system_prompt, content, llm_timeout, model=model)
+            data = _parse_json(raw)
+            used_model = model
+            break
+        except Exception as e:
+            if attempt == 0:
+                logger.warning(
+                    "Primary model %s failed for %s %s: %s, trying fallback",
+                    settings.ta_model, submission.student_id, submission.student_name, e,
+                )
+            elif attempt == len(fallback_models):
+                raise  # last fallback also failed
+
+    if data is None:
+        raise ValueError(f"All models failed for {submission.student_id} {submission.student_name}")
+
+    elapsed = time.time() - start
 
     def _f(val, default: float = 0.0) -> float:
         return float(val) if val is not None else default
@@ -425,6 +529,8 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
         total_score = llm_total_score
         total_max = llm_total_max
 
+    fallback_used = used_model != settings.ta_model
+
     result = ScoringResult(
         student_id=submission.student_id,
         student_name=submission.student_name,
@@ -437,7 +543,12 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
         confidence=confidence,
         llm_reasoning=data.get("llm_reasoning", ""),
         student_feedback=data.get("student_feedback", ""),
-        needs_review=(confidence < settings.review_threshold or len(uncertain) > 0 or total_score < total_max),
+        needs_review=(
+            fallback_used
+            or confidence < settings.review_threshold
+            or len(uncertain) > 0
+            or total_score < total_max
+        ),
         processing_notes=processing_notes,
     )
 
@@ -450,7 +561,7 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
         result.confidence,
         result.processing_notes,
         provider,
-        settings.ta_model,
+        used_model,
         elapsed,
     )
 
@@ -491,21 +602,87 @@ def _fix_string_newlines(s: str) -> str:
     return ''.join(result)
 
 
+def _fix_chinese_inline_quotes(s: str) -> str:
+    """Escape ASCII/U+201C/U+201D double-quotes used as Chinese quotation marks
+    inside JSON string values.  Only a \" followed by JSON structural chars
+    (comma, colon, brace, bracket) is treated as a real JSON terminator."""
+    result: list[str] = []
+    in_string = False
+    escape = False
+    prev = ''
+    for i, ch in enumerate(s):
+        if escape:
+            result.append(ch)
+            escape = False
+            prev = ch
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape = True
+            prev = ch
+            continue
+        if ch == '"':
+            if in_string:
+                tail = s[i + 1:i + 4] if i + 1 < len(s) else ''
+                next_non_ws = tail.lstrip()
+                if next_non_ws and next_non_ws[0] in ',:}]':
+                    in_string = False  # real JSON terminator
+                else:
+                    result.append('\\')  # inline quote, escape it; stay in_string
+            else:
+                in_string = True
+        prev = ch
+        result.append(ch)
+    return ''.join(result)
+
+
+def _extract_top_level_braces(text: str) -> list[str]:
+    """Extract top-level brace-delimited blocks, handling nesting."""
+    blocks: list[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                blocks.append(text[start:i+1])
+                start = -1
+    return blocks
+
+
 def _parse_json(raw: str) -> dict:
     """Extract JSON from model output, tolerating minor formatting issues."""
     cleaned = raw.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # Strip model thinking / CoT tags
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<thinking>.*?</thinking>", "", cleaned, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+
+    # Extract JSON from ```json ... ``` code blocks anywhere in the text
+    # (not just at the start — M3 often writes commentary before the block)
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        # Also try: strip leading ```json if it's at the start
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
     cleaned = cleaned.strip()
 
     last_err: json.JSONDecodeError | None = None
 
-    # Try progressively more aggressive fixes
+    # Try progressively more aggressive fixes on the full text
     fixes = [
         lambda x: x,                                    # raw
         _fix_string_newlines,                           # fix newlines in strings
         _sanitize_json,                                 # fix stray backslashes
         lambda x: _sanitize_json(_fix_string_newlines(x)),  # both
+        _fix_chinese_inline_quotes,                     # escape Chinese inline quotes
     ]
     for fix in fixes:
         candidate = fix(cleaned)
@@ -514,15 +691,58 @@ def _parse_json(raw: str) -> dict:
         except json.JSONDecodeError as e:
             last_err = e
 
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        block = match.group()
+    blocks = list(re.finditer(r"\{[^}]*\}", cleaned, re.DOTALL))
+
+    # Strategy 2: find ALL {...} blocks, try each (last-first, since the real JSON
+    # is usually at the end, and earlier braces like {s₀, t₀} are noise)
+    # Strategy 3: use "breakdown" keyword to locate JSON
+    # (LLMs like MiniMax-M3 often output analysis text containing {…} in
+    # set notation, which confuses top-level brace extraction.  The JSON
+    # always starts with a "breakdown" key – use that as a reliable anchor.)
+    bd_idx = cleaned.rfind('"breakdown"')
+    if bd_idx >= 0:
+        obj_start = cleaned.rfind('{', 0, bd_idx)
+        if obj_start >= 0:
+            depth = 0
+            obj_end = -1
+            for idx in range(obj_start, len(cleaned)):
+                if cleaned[idx] == '{':
+                    depth += 1
+                elif cleaned[idx] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        obj_end = idx + 1
+                        break
+            if obj_end > 0:
+                block_str = cleaned[obj_start:obj_end]
+                for fix in fixes:
+                    candidate = fix(block_str)
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+
+
+
+    # Extend to matching braces for nested JSON: find top-level { ... } blocks
+    top_blocks = _extract_top_level_braces(cleaned)
+    for block_str in reversed(top_blocks):
         for fix in fixes:
-            candidate = fix(block)
+            candidate = fix(block_str)
             try:
                 return json.loads(candidate)
-            except json.JSONDecodeError as e:
-                last_err = e
+            except json.JSONDecodeError:
+                pass
+    # Also try raw regex blocks as fallback
+    if not top_blocks:
+        for match in reversed(blocks):
+            block = match.group()
+            for fix in fixes:
+                candidate = fix(block)
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
 
     # Build diagnostic detail from the last JSONDecodeError
     err_detail = ""
