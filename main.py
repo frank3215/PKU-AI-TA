@@ -791,6 +791,24 @@ def submit(
     approved_count = sum(1 for r in records if r.approved)
     console.print(f"Loaded {len(records)} record(s), {approved_count} approved.")
 
+    # Warn if late submissions lack late note
+    late_warnings = 0
+    for r in records:
+        if not r.approved:
+            continue
+        late_days = r.result.late_days
+        if late_days <= 0 or late_days > 7:
+            continue
+        notes = (r.reviewer_notes or "") + (r.result.student_feedback or "")
+        if not any(kw in notes for kw in ["晚交", "迟交", "late"]):
+            console.print(f"  [yellow]Warning:[/yellow] {r.result.student_name} ({r.result.student_id}) "
+                          f"late {late_days:.1f}d but no late mention in notes")
+            late_warnings += 1
+    if late_warnings:
+        if not Confirm.ask(f"\n[bold yellow]{late_warnings} late submission(s) missing late note. Continue?[/bold yellow]", default=False):
+            console.print("[yellow]Aborted.[/yellow]")
+            raise typer.Exit(1)
+
     if approved_count == 0:
         console.print("[yellow]Nothing to submit — no records marked approved.[/yellow]")
         raise typer.Exit(0)
