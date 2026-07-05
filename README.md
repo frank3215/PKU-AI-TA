@@ -201,6 +201,8 @@ A backup of the original file is saved as `scores.bak.xlsx`.
 
 #### Option A: Interactive TUI (recommended)
 
+Detailed workflow guide: [docs/tui-review.md](docs/tui-review.md)
+
 ```bash
 # Review only students flagged for review
 uv run python main.py review --needs-review
