@@ -169,26 +169,32 @@ def _text_looks_garbled(text: str) -> bool:
         return False
 
     # Signal 1: High ratio of control / non-printable characters
+    # Exclude Private Use (Co) — PDF fonts use them for math symbols
     control_count = sum(
         1 for c in text
         if unicodedata.category(c).startswith('C') and c not in '\t\n\r'
+        and unicodedata.category(c) != 'Co'
     )
     if control_count > len(text) * 0.01:
         return True
 
     # Signal 2: check word-like tokens. OCR gibberish produces very short
     # "words" with low vowel ratio, while real English has longer vowel-rich tokens.
-    tokens = [t for t in re.split(r'\s+', text) if re.search(r'[a-zA-Z]', t)]
-    if len(tokens) >= 10:
-        avg_len = sum(len(t) for t in tokens) / len(tokens)
-        # OCR gibberish: avg length < 3.5 (e.g. "Ed", "Kij", "flig")
-        # Real English: avg length ~4.5-5.5
-        if avg_len < 3.8:
-            vowelled = sum(1 for t in tokens if any(
-                c.lower() in 'aeiouy' for c in t if c.isalpha()
-            ))
-            if vowelled / len(tokens) < 0.5:
-                return True
+    # Skip this check for texts with meaningful CJK content — short tokens are
+    # likely mathematical notation (E(f), i, j, s, t) not OCR garbage.
+    cjk = sum(1 for ch in text if '一' <= ch <= '鿿')
+    if cjk / max(len(text), 1) < 0.05:
+        tokens = [t for t in re.split(r'\s+', text) if re.search(r'[a-zA-Z]', t)]
+        if len(tokens) >= 10:
+            avg_len = sum(len(t) for t in tokens) / len(tokens)
+            # OCR gibberish: avg length < 3.5 (e.g. "Ed", "Kij", "flig")
+            # Real English: avg length ~4.5-5.5
+            if avg_len < 3.8:
+                vowelled = sum(1 for t in tokens if any(
+                    c.lower() in 'aeiouy' for c in t if c.isalpha()
+                ))
+                if vowelled / len(tokens) < 0.5:
+                    return True
 
     # Signal 3: vowelless Latin sequences (OCR garbage like "ftityi")
     # Skip this check for texts with reasonable CJK content — they're legit.
@@ -216,12 +222,15 @@ def _needs_vision(text: str, attachment: Attachment | None = None) -> bool:
     if any(marker in text for marker in _UNREADABLE_MARKERS):
         return True
 
-    # If PDF has embedded images, use vision mode (avoids OCR text layer issues)
+    stripped = text.strip()
+
+    # If PDF has embedded images, use vision mode unless text extraction
+    # produced usable content (typed homework with just header images).
     if attachment and attachment.filename.lower().endswith('.pdf'):
         if _pdf_has_embedded_images(attachment.data):
-            return True
-
-    stripped = text.strip()
+            if len(stripped) < 500 or _text_looks_garbled(stripped):
+                return True
+            # Text is long enough and doesn't look garbled → trust extraction
     # Very short extracted text almost certainly means watermarks only, not real content
     if len(stripped) < 200:
         return True
