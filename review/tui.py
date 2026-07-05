@@ -239,12 +239,12 @@ def run_review_tui(
             else:
                 console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
 
-            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "u", "R", "recall", "j", "jump", "q", "quit"]
+            choices = ["a", "approve", "s", "skip", "n", "notes", "T", "o", "open", "r", "rubric", "u", "R", "recall", "j", "jump", "q", "quit"]
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (T)ype (o)pen (r)ubric (ov)erride [yellow](u)[/yellow]ncert. [yellow](R)[/yellow]ecall [yellow](j)[/yellow]ump (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (n)otes (T)ype (o)pen (r)ubric [yellow](u)[/yellow]ncert. [yellow](R)[/yellow]ecall [yellow](j)[/yellow]ump (b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,
