@@ -551,7 +551,7 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
         uncertain_parts=uncertain,
         confidence=confidence,
         llm_reasoning=data.get("llm_reasoning", ""),
-        student_feedback=data.get("student_feedback", ""),
+        student_feedback=data.get("student_feedback", "").replace("\\n", "\n"),
         needs_review=(
             fallback_used
             or confidence < settings.review_threshold

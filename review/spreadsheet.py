@@ -210,7 +210,7 @@ def load_reviewed(path: Path) -> list[ReviewRecord]:
             breakdown=breakdown,
             uncertain_parts=uncertain,
             llm_reasoning=str(row[idx["llm_reasoning"]] or ""),
-            student_feedback=str(row[idx["reviewer_notes"]] or ""),
+            student_feedback=str(row[idx["reviewer_notes"]] or "").replace("\\n", "\n"),
             processing_notes=str(row[idx["processing_notes"]] or "") if "processing_notes" in idx else "",
             late_days=float(row[idx["late_days"]]) if "late_days" in idx and row[idx["late_days"]] not in (None, "") else 0.0,
             late_penalty=float(row[idx["late_penalty"]]) if "late_penalty" in idx and row[idx["late_penalty"]] not in (None, "") else 0.0,
