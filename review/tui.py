@@ -209,7 +209,7 @@ def run_review_tui(
         _skip_display = False
         while True:
             if session._jump_row_data is not None:
-                row_idx, row_data = -1, session._jump_row_data
+                row_idx, row_data = session._jump_row_idx, session._jump_row_data
             else:
                 current_row = session.get_current_row()
                 if current_row is None:
@@ -271,8 +271,8 @@ def run_review_tui(
                     handle_jump(session, query, console)
                 continue
 
-            # External jump state: only allow read-only actions (o, r, R, j, u, q)
-            if session._jump_row_data is not None and action not in ("q", "quit", "o", "open", "r", "rubric", "u"):
+            # External jump state: only allow view + notes actions
+            if session._jump_row_data is not None and action not in ("q", "quit", "n", "notes", "o", "open", "r", "rubric", "u"):
                 session._jump_row_data = None
                 console.print("[dim]Returned to review queue.[/dim]")
                 continue

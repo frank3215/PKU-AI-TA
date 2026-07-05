@@ -448,6 +448,7 @@ class ReviewSession:
         self.append_uncertain_to_notes = append_uncertain
         # Set by handle_jump when jumping to a student outside the review queue
         self._jump_row_data: dict | None = None
+        self._jump_row_idx: int = -1
 
         # Infer assignment_id from the first row of the spreadsheet so we can
         # locate the correct submission directory.
@@ -745,14 +746,17 @@ def handle_jump(session: ReviewSession, query: str, console: Console) -> bool:
     ws = session.ws
     headers = [str(c.value or "") for c in ws[1]]
     col_idx = {name: i for i, name in enumerate(headers)}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row:
+    for row_obj in ws.iter_rows(min_row=2):
+        row_cells = [c.value for c in row_obj]
+        if not any(row_cells):
             continue
-        sid = str(row[col_idx.get("student_id", 0)] or "").lower()
-        sname = str(row[col_idx.get("student_name", 1)] or "").lower()
+        sid = str(row_cells[col_idx.get("student_id", 0)] or "").lower()
+        sname = str(row_cells[col_idx.get("student_name", 1)] or "").lower()
         if q in sid or q in sname:
-            row_data = {name: row[i] if i < len(row) else None for name, i in col_idx.items()}
+            excel_row = row_obj[0].row  # actual Excel row number
+            row_data = {name: row_cells[i] if i < len(row_cells) else None for name, i in col_idx.items()}
             session._jump_row_data = row_data
+            session._jump_row_idx = excel_row
             console.print(f"[yellow]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}) [outside review queue].[/yellow]")
             return True
 
