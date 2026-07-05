@@ -881,6 +881,7 @@ def review(
     Use --auto-approve to automatically approve students with 100/100 and needs_review=NO.
     """
     from review.tui import run_review_tui
+    from config import settings as _settings
 
     try:
         run_review_tui(
@@ -891,6 +892,7 @@ def review(
             needs_review_only=needs_review_only,
             all_students=all_students,
             auto_approve=auto_approve,
+            append_uncertain=_settings.append_uncertain_to_notes,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -902,6 +904,24 @@ def review(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
+
+
+@app.command("review-gui")
+def review_gui(
+    scores: Annotated[Path, typer.Option(help="Scores Excel file to review")] = Path("scores.xlsx"),
+    submissions: Annotated[Path, typer.Option(help="Directory with downloaded submission files")] = Path("submissions"),
+    needs_review: Annotated[bool, typer.Option("--needs-review", "-n", help="Only show students flagged for review")] = False,
+    all_students: Annotated[bool, typer.Option("--all", "-a", help="Show all students")] = False,
+    port: Annotated[int, typer.Option(help="HTTP server port")] = 8080,
+    host: Annotated[str, typer.Option(help="HTTP server host")] = "127.0.0.1",
+) -> None:
+    """Start a local web GUI for reviewing scores side-by-side with PDF submission."""
+    if not scores.exists():
+        console.print(f"[red]Error:[/red] Scores file not found: {scores}")
+        raise typer.Exit(1)
+
+    from review.gui import run_server
+    run_server(scores, submissions, needs_review, all_students, host, port)
 
 
 def _apply_late_penalty(result, submission, due_dt_str: str, console) -> None:

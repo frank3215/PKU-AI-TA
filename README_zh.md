@@ -145,7 +145,6 @@ uv run python main.py review --auto-approve --needs-review
 |---|---|---|
 | `a` | 通过并进入下一位 | 否 |
 | `n` | 编辑审阅笔记——**在此写扣分理由** | 是 |
-| `T` | 笔记输入（内置文本输入，不调外部编辑器） | 是 |
 | `o` | 打开提交文件 | 是 |
 | `r` | 打开评分标准 | 是 |
 | `u` | 切换 Uncertain Parts 自动追加到笔记 | 是 |

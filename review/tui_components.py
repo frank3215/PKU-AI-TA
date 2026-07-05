@@ -438,7 +438,7 @@ def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
 
 class ReviewSession:
     """Manages the state of an interactive review session."""
-    def __init__(self, scores: Path, needs_review_only: bool, all_students: bool, filter_ids: set[str] | None = None):
+    def __init__(self, scores: Path, needs_review_only: bool, all_students: bool, filter_ids: set[str] | None = None, append_uncertain: bool = False):
         self.scores = scores
         self.wb, self.idx, self.rows = load_review_data(scores, needs_review_only, all_students, filter_ids)
         self.ws = self.wb.active
@@ -446,7 +446,7 @@ class ReviewSession:
         self.modified_rows: dict[int, dict] = {}
         self.modified = False
         # When True, prepopulate uncertain parts into notes on first edit
-        self.append_uncertain_to_notes = False
+        self.append_uncertain_to_notes = append_uncertain
 
         # Infer assignment_id from the first row of the spreadsheet so we can
         # locate the correct submission directory.
@@ -644,6 +644,22 @@ def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown:
     session.update_row(row_idx, row_data)
     console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
     return breakdown
+
+
+def _persist_env_bool(key: str, value: bool) -> None:
+    """Update a boolean setting in .env, preserving comments and layout."""
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    line = f"{key.upper()}={str(value).lower()}"
+    text = env_path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{key.upper()}\s*=\s*(true|false)", re.IGNORECASE | re.MULTILINE)
+    if pattern.search(text):
+        text = pattern.sub(line, text)
+    else:
+        text = text.rstrip("\n") + "\n" + line + "\n"
+    env_path.write_text(text, encoding="utf-8")
+
 
 def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
     """Search approved students' reviewer_notes for lines matching query.

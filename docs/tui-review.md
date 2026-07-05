@@ -24,7 +24,6 @@ uv run python main.py review --auto-approve --needs-review
 |---|---|---|
 | `a` | Approve and advance to next student | No |
 | `n` | Add / edit reviewer notes — **write deductions here** | Yes |
-| `T` | Notes input (built-in text prompt, no external editor) | Yes |
 | `o` | Open submission file with system viewer | Yes |
 | `r` | Open rubric file | Yes |
 | `u` | Toggle uncertain parts auto-append to notes | Yes |
@@ -36,11 +35,11 @@ uv run python main.py review --auto-approve --needs-review
 
 ## Core Workflow: Notes-based Override
 
-The preferred way to adjust scores is through **reviewer notes** (`n` / `T`). This replaces the now-hidden `e` (edit) and `ov` (override) commands.
+The preferred way to adjust scores is through **reviewer notes** (`n`). This replaces the now-hidden `e` (edit) and `ov` (override) commands.
 
 ### How it works
 
-1. Press `n` to open the system editor (or `T` for the built-in prompt).
+1. Press `n` to open the system editor.
 2. Write your assessment. To deduct points, use the format:
 
    ```

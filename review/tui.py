@@ -33,6 +33,7 @@ from review.tui_components import (
     handle_override,
     handle_recall,
     handle_jump,
+    _persist_env_bool,
 )
 
 
@@ -176,6 +177,7 @@ def run_review_tui(
     all_students: bool = False,
     auto_approve: bool = False,
     filter_ids: set[str] | None = None,
+    append_uncertain: bool = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one."""
     if not scores.exists():
@@ -188,7 +190,7 @@ def run_review_tui(
         console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
 
     console.print(f"Loading spreadsheet: {scores}")
-    session = ReviewSession(scores, needs_review_only, all_students, filter_ids)
+    session = ReviewSession(scores, needs_review_only, all_students, filter_ids, append_uncertain)
 
     if not session.rows:
         console.print("[yellow]No students to review with the current filters.[/yellow]")
@@ -200,7 +202,7 @@ def run_review_tui(
         if auto_approve_students(session.ws, session.idx, console):
             # Save the changes before reloading
             session.wb.save(scores)
-            session = ReviewSession(scores, needs_review_only, all_students)
+            session = ReviewSession(scores, needs_review_only, all_students, append_uncertain=append_uncertain)
             console.print(f"[green]{len(session.rows)} student(s) remaining to review after auto-approve.[/green]")
 
     try:
@@ -278,6 +280,7 @@ def run_review_tui(
                 handle_override(session, row_idx, row_data, console)
             elif action == "u":
                 session.append_uncertain_to_notes = not session.append_uncertain_to_notes
+                _persist_env_bool("APPEND_UNCERTAIN_TO_NOTES", session.append_uncertain_to_notes)
                 console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
             elif action in ("R", "recall"):
                 query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]")

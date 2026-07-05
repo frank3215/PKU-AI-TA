@@ -223,7 +223,6 @@ TUI key bindings:
 |---|---|---|
 | `a` | Approve and advance to next student | No |
 | `n` | Add / edit reviewer notes — **write deductions here** to auto-suggest override | Yes |
-| `T` | Notes input (built-in prompt, no external editor) | Yes |
 | `o` | Open submission file with system viewer | Yes |
 | `r` | Open rubric file | Yes |
 | `u` | Toggle uncertain parts auto-append to notes | Yes |
