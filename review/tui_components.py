@@ -155,7 +155,9 @@ def _suggest_override_from_notes(notes: str, total_max: float) -> float | None:
     Returns the suggested score (total_max - sum_of_deductions) if any
     deductions are found, otherwise None.
     """
-    deductions = re.findall(r"扣\s*(\d+(?:\.\d+)?)\s*分", notes)
+    # Remove "各扣X分" (ambiguous per-item deduction) before parsing
+    cleaned = re.sub(r"各\s*扣\s*\d+(?:\.\d+)?\s*分", "", notes)
+    deductions = re.findall(r"扣\s*(\d+(?:\.\d+)?)\s*分", cleaned)
     if not deductions:
         return None
     total_deduction = sum(float(d) for d in deductions)
@@ -679,13 +681,22 @@ def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
     notes_col = col_idx.get("reviewer_notes")
     sid_col = col_idx.get("student_id")
     name_col = col_idx.get("student_name")
+    approved_col = col_idx.get("approved")
 
     if any(c is None for c in (notes_col, sid_col, name_col)):
         console.print("[red]Required columns not found in spreadsheet.[/red]")
         return
 
     pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
-    results: list[str] = []
+
+    class _RecallMatch:
+        def __init__(self, sid, sname, line, approved):
+            self.sid = sid
+            self.sname = sname
+            self.line = line
+            self.approved = approved
+
+    matches: list[_RecallMatch] = []
 
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or not row[sid_col]:
@@ -693,20 +704,28 @@ def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
         sid = str(row[sid_col] or "").strip()
         sname = str(row[name_col] or "").strip()
         notes = str(row[notes_col] or "")
+        approved = approved_col is not None and str(row[approved_col] or "").upper() == "YES"
         if not notes:
             continue
 
         for line in notes.split("\n"):
             line = line.strip()
             if line and pattern.search(line):
-                results.append(f"{sid}_{sname}: {line}")
+                matches.append(_RecallMatch(sid, sname, line, approved))
 
-    if results:
+    if matches:
         from rich.table import Table as RichTable
-        t = RichTable(title=f"Recall: '{query}' ({len(results)} match(es))", box=None, expand=True)
+        from rich.text import Text
+        t = RichTable(title=f"Recall: '{query}' ({len(matches)} match(es))", box=None, expand=True)
         t.add_column("Match", overflow="fold")
-        for r in results:
-            t.add_row(r)
+        for m in matches:
+            label = f"{m.sid}_{m.sname}"
+            prefix = Text.assemble(
+                (label, "green" if m.approved else "yellow"),
+                (": ", ""),
+            )
+            line_text = Text(m.line)
+            t.add_row(Text.assemble(prefix, line_text))
         console.print(t)
     else:
         console.print(f"[yellow]No matches for '{query}' in approved records.[/yellow]")
