@@ -555,14 +555,6 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     console.print("[green]Updated reviewer notes.[/green]")
     _maybe_offer_override(session, row_idx, row_data, console, new_notes)
 
-    # Auto-append late submission info if missing (only if user removed it)
-    augmented = _ensure_late_note(row_data, new_notes)
-    if augmented != new_notes:
-        row_data["reviewer_notes"] = augmented
-        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=augmented)
-        session.update_row(row_idx, row_data)
-        console.print("[dim]Auto-appended late submission note.[/dim]")
-
     _maybe_offer_full_score(session, row_idx, row_data, console)
 
 
@@ -581,14 +573,6 @@ def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, co
     session.update_row(row_idx, row_data)
     console.print("[green]Updated reviewer notes.[/green]")
     _maybe_offer_override(session, row_idx, row_data, console, new_notes)
-
-    # Auto-append late submission info if missing (only if user removed it)
-    augmented = _ensure_late_note(row_data, new_notes)
-    if augmented != new_notes:
-        row_data["reviewer_notes"] = augmented
-        session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=augmented)
-        session.update_row(row_idx, row_data)
-        console.print("[dim]Auto-appended late submission note.[/dim]")
 
     _maybe_offer_full_score(session, row_idx, row_data, console)
 
