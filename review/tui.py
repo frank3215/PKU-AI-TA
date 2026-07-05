@@ -32,6 +32,7 @@ from review.tui_components import (
     handle_notes_prompt,
     handle_override,
     handle_recall,
+    handle_jump,
 )
 
 
@@ -234,12 +235,12 @@ def run_review_tui(
             else:
                 console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
 
-            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "u", "R", "recall", "q", "quit"]
+            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "u", "R", "recall", "j", "jump", "q", "quit"]
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (T)ype (o)pen (r)ubric (ov)erride [yellow](u)[/yellow]ncert. [yellow](R)[/yellow]ecall (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (T)ype (o)pen (r)ubric (ov)erride [yellow](u)[/yellow]ncert. [yellow](R)[/yellow]ecall [yellow](j)[/yellow]ump (b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,
@@ -275,9 +276,16 @@ def run_review_tui(
                 session.append_uncertain_to_notes = not session.append_uncertain_to_notes
                 console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
             elif action in ("R", "recall"):
-                query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]")
-                if query.strip():
+                while True:
+                    query = Prompt.ask("[bold cyan]Recall: search notes for (empty to exit)[/bold cyan]")
+                    if not query.strip():
+                        break
                     handle_recall(session, query.strip(), console)
+                console.print()
+            elif action in ("j", "jump"):
+                query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]")
+                if query.strip():
+                    handle_jump(session, query.strip(), console)
             else: # skip
                 console.print("[dim]Skipped.[/dim]")
                 session.next_student()

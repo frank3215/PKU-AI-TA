@@ -714,6 +714,21 @@ def handle_override(session: ReviewSession, row_idx: int, row_data: dict, consol
         except ValueError:
             console.print("[red]Invalid score[/red]")
 
+
+def handle_jump(session: ReviewSession, query: str, console: Console) -> bool:
+    """Jump to a student matching name or ID. Returns True if found."""
+    q = query.strip().lower()
+    for i, (row_idx, row_data) in enumerate(session.rows):
+        sid = str(row_data.get("student_id", "") or "").lower()
+        sname = str(row_data.get("student_name", "") or "").lower()
+        if q in sid or q in sname:
+            session.current_idx = i
+            console.print(f"[green]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}).[/green]")
+            return True
+    console.print(f"[yellow]No student matching '{query}' found.[/yellow]")
+    return False
+
+
 def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, float]:
     """Interactive editor for breakdown. Returns (new_breakdown, new_total, new_max)."""
     while True:
