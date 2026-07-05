@@ -533,10 +533,10 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
                 computed_max,
             )
         total_score = computed_score
-        total_max = computed_max
+        total_max = 100.0
     else:
         total_score = llm_total_score
-        total_max = llm_total_max
+        total_max = 100.0
 
     fallback_used = used_model != settings.ta_model
 
