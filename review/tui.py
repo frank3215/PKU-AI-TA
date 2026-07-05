@@ -228,12 +228,17 @@ def run_review_tui(
                 console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
             console.print()
 
-            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
+            if session.append_uncertain_to_notes:
+                console.print("  [dim]Uncertain auto-append: [green]ON[/green][/dim]")
+            else:
+                console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
+
+            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "T", "o", "open", "r", "rubric", "ov", "override", "u", "q", "quit"]
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes→editor (T)ype (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (T)ype (o)pen (r)ubric (ov)erride [yellow](u)[/yellow]ncert.(b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,
@@ -265,6 +270,9 @@ def run_review_tui(
                     console.print(f"[yellow]Rubric file not found: {rubric}[/yellow]")
             elif action in ("ov", "override"):
                 handle_override(session, row_idx, row_data, console)
+            elif action == "u":
+                session.append_uncertain_to_notes = not session.append_uncertain_to_notes
+                console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
             else: # skip
                 console.print("[dim]Skipped.[/dim]")
                 session.next_student()

@@ -162,6 +162,11 @@ def _suggest_override_from_notes(notes: str, total_max: float) -> float | None:
     return max(0.0, total_max - total_deduction)
 
 
+# Track which students have already had late note prepopulated
+# Keyed by (student_id, assignment_id) — once shown, never prepopulate again
+_late_note_shown: set[tuple[str, str]] = set()
+
+
 def _ensure_late_note(row_data: dict, notes: str) -> str:
     """Append late submission info to notes if missing."""
     late_days = float(row_data.get("late_days") or 0)
@@ -178,6 +183,31 @@ def _ensure_late_note(row_data: dict, notes: str) -> str:
     if notes.strip():
         return notes.rstrip("\n") + "\n" + late_line
     return late_line
+
+
+def _ensure_uncertain_notes(row_data: dict, notes: str) -> str:
+    """Append uncertain parts summary to notes if missing."""
+    raw_uncertain = row_data.get("uncertain_parts_json", "")
+    if not raw_uncertain:
+        return notes
+    try:
+        uncertain = json.loads(raw_uncertain)
+    except (json.JSONDecodeError, TypeError):
+        return notes
+    if not uncertain:
+        return notes
+    # Check if already appended
+    if "--- Uncertain Parts ---" in notes or "--- 不确定项 ---" in notes:
+        return notes
+    lines = ["", "--- Uncertain Parts ---"]
+    for item in uncertain:
+        desc = str(item.get("description", "") or "")
+        sug = item.get("suggested_score", 0)
+        mx = item.get("suggested_max", 0)
+        lines.append(f"- {desc} (suggested: {sug}/{mx})")
+    if notes.strip():
+        return notes.rstrip("\n") + "\n".join(lines)
+    return "\n".join(lines).lstrip("\n")
 
 
 def _maybe_offer_full_score(
@@ -415,6 +445,8 @@ class ReviewSession:
         self.current_idx = 0
         self.modified_rows: dict[int, dict] = {}
         self.modified = False
+        # When True, prepopulate uncertain parts into notes on first edit
+        self.append_uncertain_to_notes = False
 
         # Infer assignment_id from the first row of the spreadsheet so we can
         # locate the correct submission directory.
@@ -535,7 +567,15 @@ def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console
 def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'notes' action (n). Opens an external editor for multi-line input."""
     raw_notes = str(row_data.get("reviewer_notes") or "")
-    current_notes = _ensure_late_note(row_data, raw_notes)  # prepopulate late note for editing
+    student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
+    if student_key not in _late_note_shown:
+        current_notes = raw_notes
+        if session.append_uncertain_to_notes:
+            current_notes = _ensure_uncertain_notes(row_data, current_notes)
+        current_notes = _ensure_late_note(row_data, current_notes)
+        _late_note_shown.add(student_key)
+    else:
+        current_notes = raw_notes
     console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
     try:
         new_notes = edit_in_editor(initial_text=current_notes, console=console)
@@ -561,7 +601,15 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
 def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'notes text' action (T). Uses built-in multiline prompt (no editor)."""
     raw_notes = str(row_data.get("reviewer_notes") or "")
-    current_notes = _ensure_late_note(row_data, raw_notes)  # prepopulate late note for editing
+    student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
+    if student_key not in _late_note_shown:
+        current_notes = raw_notes
+        if session.append_uncertain_to_notes:
+            current_notes = _ensure_uncertain_notes(row_data, current_notes)
+        current_notes = _ensure_late_note(row_data, current_notes)
+        _late_note_shown.add(student_key)
+    else:
+        current_notes = raw_notes
     console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
     try:
         new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)

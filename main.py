@@ -609,6 +609,141 @@ def grade(
     _try_auto_submit()
 
 
+@app.command("recheck-late")
+def recheck_late(
+    scores: Annotated[Path, typer.Option(help="Existing scores Excel file to update")] = Path("scores.xlsx"),
+    column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
+    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
+    due_date: Annotated[Optional[str], typer.Option(help="Due date (ISO 8601). Auto-fetched if omitted.")] = None,
+    late_cutoff: Annotated[Optional[str], typer.Option(help="Late cutoff date (YYYY-MM-DD, time defaults to 23:59:59 Beijing time). Overrides due_date for late checking.")] = None,
+) -> None:
+    """Re-check late penalties for an existing scores Excel using timezone-fixed logic.
+
+    Crawls each student's submitted_at from Blackboard, recalculates late_days
+    and late_penalty, and updates the spreadsheet metadata. Does NOT re-grade.
+
+    Use --late-cutoff to set a late deadline (e.g. 2 days after due date).
+    Submissions after this cutoff are marked late, regardless of the assignment's
+    original due date.
+    """
+    from datetime import datetime, timezone, timedelta
+    from zoneinfo import ZoneInfo
+
+    from auth.iaaa import get_session
+    from config import settings
+    from crawler.pku_homework import PKUHomeworkCrawler
+    from review.spreadsheet import COLUMNS
+
+    if not column:
+        console.print("[red]Error:[/red] --column is required")
+        raise typer.Exit(1)
+    if not scores.exists():
+        console.print(f"[red]Error:[/red] Scores file not found: {scores}")
+        raise typer.Exit(1)
+
+    course_id = course or settings.course_id
+    if not course_id:
+        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
+        raise typer.Exit(1)
+
+    console.print("[bold]Authenticating…[/bold]")
+    client = get_session()
+    crawler = PKUHomeworkCrawler(client, course_id, set())
+
+    # Determine cutoff: explicit --late-cutoff > fetched due_date
+    if late_cutoff:
+        cutoff_dt = datetime.strptime(late_cutoff, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=ZoneInfo("Asia/Shanghai"),
+        ).astimezone(timezone.utc)
+        console.print(f"  Late cutoff: {late_cutoff} 23:59:59 (overriding due date)")
+    else:
+        if not due_date:
+            due_date = crawler.fetch_due_date(column, "作业")
+        if not due_date:
+            console.print("[yellow]No due date available; late penalties unchecked.[/yellow]")
+            raise typer.Exit(1)
+        console.print(f"  Due date: {due_date}")
+        due_str = due_date.replace("Z", "+00:00")
+        cutoff_dt = datetime.fromisoformat(due_str)
+        if cutoff_dt.tzinfo is None:
+            cutoff_dt = cutoff_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+
+    # Load existing Excel
+    import openpyxl
+    wb = openpyxl.load_workbook(scores)
+    ws = wb.active
+    headers = [str(c.value or "") for c in ws[1]]
+    idx = {name: i + 1 for i, name in enumerate(headers)}
+
+    # Collect student IDs from Excel
+    student_ids_by_name: dict[str, str] = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        sid = str(row[idx["student_id"] - 1] or "")
+        sname = str(row[idx["student_name"] - 1] or "")
+        if sid:
+            student_ids_by_name[sname] = sid
+
+    total = len(student_ids_by_name)
+    if not total:
+        console.print("[yellow]No records found in spreadsheet.[/yellow]")
+        return
+
+    # Fetch all submissions to get submitted_at
+    console.print(f"[bold]Fetching submissions for {total} student(s)…[/bold]")
+    submissions = crawler.fetch_submissions(column, "作业")
+    sub_by_name: dict[str, str] = {s.student_name: s.submitted_at for s in submissions if s.submitted_at}
+    console.print(f"  Found submitted_at for {len(sub_by_name)}/{total} student(s)")
+
+    # Update each row
+    updated = 0
+    for row in ws.iter_rows(min_row=2):
+        row_num = row[0].row
+        sid = str(ws.cell(row=row_num, column=idx["student_id"]).value or "")
+        sname = str(ws.cell(row=row_num, column=idx["student_name"]).value or "")
+        if not sid:
+            continue
+
+        submitted_at = sub_by_name.get(sname)
+        if not submitted_at:
+            continue
+
+        # Calculate late_days with timezone fix
+        sub_dt = datetime.strptime(submitted_at, "%Y-%m-%d %H:%M:%S")
+        sub_dt = sub_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        delta = sub_dt - cutoff_dt
+        late_days = max(0.0, delta.total_seconds() / 86400)
+
+        new_penalty = 0.0
+        if late_days > 0 and late_days <= 7:
+            new_penalty = 10.0
+        elif late_days > 7:
+            new_penalty = 0.0  # submission not scorable, but we don't change scores
+
+        # Read old values
+        old_days = float(ws.cell(row=row_num, column=idx["late_days"]).value or 0)
+        old_penalty = float(ws.cell(row=row_num, column=idx["late_penalty"]).value or 0)
+
+        if abs(old_days - late_days) > 0.001 or abs(old_penalty - new_penalty) > 0.001:
+            ws.cell(row=row_num, column=idx["late_days"], value=late_days)
+            ws.cell(row=row_num, column=idx["late_penalty"], value=new_penalty)
+            updated += 1
+            change = ""
+            if old_days > 0 and late_days <= 0:
+                change = " (was late, now on time)"
+            elif old_days <= 0 and late_days > 0:
+                change = " (was on time, now late)"
+            console.print(f"  [cyan]{sid} {sname}[/cyan] submitted {submitted_at}: {old_days:.2f}d → {late_days:.2f}d{change}")
+
+    # Backup the original file before modifying
+    backup = scores.with_suffix(f".bak{scores.suffix}")
+    import shutil
+    shutil.copy2(scores, backup)
+    console.print(f"  [dim]Backup saved to {backup.name}[/dim]")
+
+    wb.save(scores)
+    console.print(f"\n[green]Done. Updated {updated}/{total} record(s).[/green]")
+
+
 @app.command()
 def submit(
     course: Annotated[str, typer.Option(help="Blackboard course ID")] = "",
