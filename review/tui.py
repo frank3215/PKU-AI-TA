@@ -204,6 +204,7 @@ def run_review_tui(
             console.print(f"[green]{len(session.rows)} student(s) remaining to review after auto-approve.[/green]")
 
     try:
+        _skip_display = False
         while True:
             current_row = session.get_current_row()
             if current_row is None:
@@ -217,7 +218,10 @@ def run_review_tui(
             except json.JSONDecodeError:
                 breakdown = []
 
-            display_student(console, row_data, i, len(session.rows), breakdown)
+            if not _skip_display:
+                display_student(console, row_data, i, len(session.rows), breakdown)
+            _skip_display = False
+
             student_id = str(row_data["student_id"])
             student_name = str(row_data["student_name"])
             sub_file = find_submission_file(submissions, student_id, student_name, assignment_id=session.assignment_id)
@@ -276,12 +280,10 @@ def run_review_tui(
                 session.append_uncertain_to_notes = not session.append_uncertain_to_notes
                 console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
             elif action in ("R", "recall"):
-                while True:
-                    query = Prompt.ask("[bold cyan]Recall: search notes for (empty to exit)[/bold cyan]")
-                    if not query.strip():
-                        break
+                query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]")
+                if query.strip():
                     handle_recall(session, query.strip(), console)
-                console.print()
+                _skip_display = True
             elif action in ("j", "jump"):
                 query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]")
                 if query.strip():
