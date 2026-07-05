@@ -2,9 +2,11 @@
 PKU AI Teaching Assistant CLI
 
 Commands:
-  ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx] [--verbose] [--resume] [--lang en|zh]
-  ta review  [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
-  ta submit  --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
+  ta grade         --course <id> --column <id> --rubric <file> [--student-list <file>] [--out scores.xlsx] [--verbose] [--resume]
+  ta recheck-late  --scores <file> --column <id> [--late-cutoff YYYY-MM-DD]
+  ta review        [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
+  ta submit        --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
+  ta list          [--course <id>]
 """
 from __future__ import annotations
 

@@ -148,8 +148,11 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 | `--prompt` | System prompt file for the LLM (default: `prompts/system_zh.md`) |
 | `--verbose` / `-v` | Print each student's result as it's scored |
 | `--resume` / `-r` | Resume a previously interrupted run |
+| `--student-list` | File with one student ID per line (alternative to `--whitelist`) |
 | `--regrade-unapproved` | Keep approved students, regrade the rest |
 | `--threads` | Number of parallel scoring threads (default: from `.env` or 4) |
+| `--due-date` | Due date (ISO 8601). Auto-fetched if omitted |
+| `--log-file` | Log file path (default: `grade.log`) |
 
 > **Using Anthropic-compatible endpoint:**
 > ```bash
@@ -172,6 +175,27 @@ This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence
 > …/getStudentWork.do?course_id=_98024_1&gradeBookPK=423829&title=第一次作业
 > ```
 > Copy the bare number after `gradeBookPK=`, e.g. `423829`.
+
+### Re-check late penalties (step 1b)
+
+Reload an existing scores Excel, recalculate `late_days` and `late_penalty` with timezone-fixed logic, and update metadata without re-grading:
+
+```bash
+# Use the assignment's original due date (auto-fetched from Blackboard)
+uv run python main.py recheck-late --scores scores_426252.xlsx --column 426252
+
+# Override the late cutoff date (time defaults to 23:59:59 Beijing time)
+uv run python main.py recheck-late --scores scores_426252.xlsx --column 426252 --late-cutoff 2026-05-13
+```
+
+| Flag | Description |
+|---|---|
+| `--scores` | Existing scores Excel file to update |
+| `--column` | Assignment `gradeBookPK` |
+| `--course` | Blackboard course ID (or set `COURSE_ID` in `.env`) |
+| `--late-cutoff` | Override late deadline (YYYY-MM-DD, time 23:59:59). Overrides fetched due date |
+
+A backup of the original file is saved as `scores.bak.xlsx`.
 
 ### Step 2 — Review
 
@@ -196,11 +220,13 @@ TUI key bindings:
 | Key | Action | Stays on page |
 |---|---|---|
 | `a` | Approve and advance to next student | No |
-| `e` | Edit individual criterion scores interactively | Yes |
-| `n` | Add / edit reviewer notes | Yes |
-| `ov` | Set override score | Yes |
+| `n` | Add / edit reviewer notes — **write deductions here** to auto-suggest override | Yes |
+| `T` | Notes input (built-in prompt, no external editor) | Yes |
 | `o` | Open submission file with system viewer | Yes |
 | `r` | Open rubric file | Yes |
+| `u` | Toggle uncertain parts auto-append to notes | Yes |
+| `R` | Recall — search approved notes for keyword (e.g. `7.4`) | Yes |
+| `j` | Jump to student by name or ID | No |
 | `s` | Skip (do not approve), advance to next | No |
 | `b` | Go back to previous student | No |
 | `q` | Quit | — |
