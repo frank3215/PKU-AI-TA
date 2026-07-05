@@ -139,7 +139,7 @@ uv run python main.py review --all
 uv run python main.py review --auto-approve --needs-review
 ```
 
-**详细操作指南：[docs/tui-review.md](docs/tui-review.md)**
+**详细操作指南：[docs/tui-review-zh.md](docs/tui-review-zh.md)**
 
 | 快捷键 | 功能 | 是否翻页 |
 |---|---|---|
@@ -168,7 +168,7 @@ uv run python main.py submit --course _98024_1 --column 426252 --scores scores.x
 
 ## TUI 详细工作流
 
-详细的操作指南请参见 **[docs/tui-review.md](docs/tui-review.md)**，包括：
+详细的操作指南请参见 **[docs/tui-review-zh.md](docs/tui-review-zh.md)**，包括：
 
 - 笔记驱动的核分流程
 - Uncertain Parts 处理
