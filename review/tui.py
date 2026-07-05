@@ -241,16 +241,30 @@ def run_review_tui(
             else:
                 console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
 
-            choices = ["a", "approve", "s", "skip", "n", "notes", "o", "open", "r", "rubric", "u", "R", "recall", "j", "jump", "q", "quit"]
-            if session.current_idx > 0:
-                choices.extend(["b", "back"])
-
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (n)otes (o)pen (r)ubric [yellow](u)[/yellow]ncert. [yellow](R)[/yellow]ecall [yellow](j)[/yellow]ump (b)ack (q)uit[/dim]",
-                choices=choices,
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (n)otes (o)pen (r)ubric [yellow](u)[/yellow]ncert. [yellow]R[/yellow] query [yellow]j[/yellow] name (b)ack (q)uit[/dim]",
                 default="skip",
-                show_choices=False,
             )
+
+            # Inline commands: "R 7.17" or "j 解成" (bare "R"/"j" prompts for query)
+            action_stripped = action.strip()
+            if action_stripped.upper() in ("R", "RECALL") or action_stripped.upper().startswith("R ") or action_stripped.lower().startswith("recall "):
+                _, _, query = action_stripped.partition(" ")
+                query = query.strip()
+                if not query:
+                    query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]").strip()
+                if query:
+                    handle_recall(session, query, console)
+                _skip_display = True
+                continue
+            if action_stripped.lower() in ("j", "jump") or action_stripped.lower().startswith("j ") or action_stripped.lower().startswith("jump "):
+                _, _, query = action_stripped.partition(" ")
+                query = query.strip()
+                if not query:
+                    query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]").strip()
+                if query:
+                    handle_jump(session, query, console)
+                continue
 
             if action in ("q", "quit"):
                 console.print("[yellow]Quitting...[/yellow]")
@@ -282,15 +296,6 @@ def run_review_tui(
                 session.append_uncertain_to_notes = not session.append_uncertain_to_notes
                 _persist_env_bool("APPEND_UNCERTAIN_TO_NOTES", session.append_uncertain_to_notes)
                 console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
-            elif action in ("R", "recall"):
-                query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]")
-                if query.strip():
-                    handle_recall(session, query.strip(), console)
-                _skip_display = True
-            elif action in ("j", "jump"):
-                query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]")
-                if query.strip():
-                    handle_jump(session, query.strip(), console)
             else: # skip
                 console.print("[dim]Skipped.[/dim]")
                 session.next_student()
