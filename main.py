@@ -904,31 +904,26 @@ def review(
     from review.tui import run_review_tui
     from config import settings as _settings
 
+    import openpyxl
     submitted_ids: set[str] | None = None
-    if skip_submitted:
+    if skip_submitted and scores.exists():
         try:
-            from auth.iaaa import get_session
-            from crawler.pku_homework import PKUHomeworkCrawler
-            from submitter.blackboard import _fetch_existing_grade, _fetch_student_meta
-            from pathlib import Path
-
-            course_id = _settings.course_id
-            if course_id:
-                console.print("[bold]Fetching existing grades from Blackboard…[/bold]")
-                client = get_session()
-                crawler = PKUHomeworkCrawler(client, course_id, set())
-                student_meta, _ = _fetch_student_meta(client, course_id, "427335")
+            wb = openpyxl.load_workbook(scores)
+            ws = wb.active
+            headers = [str(c.value or "") for c in ws[1]]
+            sid_col = None
+            approved_col = None
+            for i, h in enumerate(headers):
+                if h == "student_id": sid_col = i
+                if h == "approved": approved_col = i
+            if sid_col is not None and approved_col is not None:
                 submitted_ids = set()
-                for bb_id, meta in student_meta.items():
-                    try:
-                        existing = _fetch_existing_grade(client, course_id, "427335", bb_id)
-                        if existing is not None:
-                            submitted_ids.add(meta.get("student_id", ""))
-                    except Exception:
-                        continue
-                console.print(f"  Found {len(submitted_ids)} student(s) already submitted.")
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if row[sid_col] and str(row[approved_col] or "").upper() == "YES":
+                        submitted_ids.add(str(row[sid_col]))
+                console.print(f"  [dim]Found {len(submitted_ids)} already-approved student(s) in Excel.[/dim]")
         except Exception as e:
-            console.print(f"[yellow]Warning: Could not fetch submitted status: {e}[/yellow]")
+            console.print(f"[yellow]Warning: Could not read approved status: {e}[/yellow]")
 
     try:
         run_review_tui(
