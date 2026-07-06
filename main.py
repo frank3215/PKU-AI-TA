@@ -762,6 +762,7 @@ def submit(
     from auth.iaaa import get_session
     from config import settings
     from review.spreadsheet import load_reviewed
+    from rich.prompt import Confirm
     from submitter.blackboard import submit_scores
 
     if not scores.exists():
@@ -891,6 +892,7 @@ def review(
     all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
     auto_approve: Annotated[bool, typer.Option("--auto-approve", help="Auto-approve 100-point submissions that don't need review")] = False,
     auto_skip_late: Annotated[bool, typer.Option("--auto-skip-late", help="Auto-skip students with >7d late submission (score set to 0)")] = False,
+    skip_submitted: Annotated[bool, typer.Option("--skip-submitted", help="Skip students already graded on Blackboard")] = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
@@ -901,6 +903,32 @@ def review(
     """
     from review.tui import run_review_tui
     from config import settings as _settings
+
+    submitted_ids: set[str] | None = None
+    if skip_submitted:
+        try:
+            from auth.iaaa import get_session
+            from crawler.pku_homework import PKUHomeworkCrawler
+            from submitter.blackboard import _fetch_existing_grade, _fetch_student_meta
+            from pathlib import Path
+
+            course_id = _settings.course_id
+            if course_id:
+                console.print("[bold]Fetching existing grades from Blackboard…[/bold]")
+                client = get_session()
+                crawler = PKUHomeworkCrawler(client, course_id, set())
+                student_meta, _ = _fetch_student_meta(client, course_id, "427335")
+                submitted_ids = set()
+                for bb_id, meta in student_meta.items():
+                    try:
+                        existing = _fetch_existing_grade(client, course_id, "427335", bb_id)
+                        if existing is not None:
+                            submitted_ids.add(meta.get("student_id", ""))
+                    except Exception:
+                        continue
+                console.print(f"  Found {len(submitted_ids)} student(s) already submitted.")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not fetch submitted status: {e}[/yellow]")
 
     try:
         run_review_tui(
@@ -913,6 +941,7 @@ def review(
             auto_approve=auto_approve,
             append_uncertain=_settings.append_uncertain_to_notes,
             auto_skip_late=auto_skip_late,
+            submitted_ids=submitted_ids,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")

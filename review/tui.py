@@ -179,6 +179,7 @@ def run_review_tui(
     filter_ids: set[str] | None = None,
     append_uncertain: bool = False,
     auto_skip_late: bool = False,
+    submitted_ids: set[str] | None = None,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one."""
     if not scores.exists():
@@ -222,6 +223,20 @@ def run_review_tui(
             session.rows = remaining_rows
             session.current_idx = 0
             console.print(f"[yellow]Skipped {skipped} student(s) due to >7d late submission.[/yellow]")
+
+    if submitted_ids:
+        skipped = 0
+        remaining_rows = []
+        for row_idx, row_data in session.rows:
+            sid = str(row_data.get("student_id", ""))
+            if sid in submitted_ids:
+                skipped += 1
+            else:
+                remaining_rows.append((row_idx, row_data))
+        if skipped:
+            session.rows = remaining_rows
+            session.current_idx = 0
+            console.print(f"[yellow]Skipped {skipped} student(s) already submitted to Blackboard.[/yellow]")
 
     try:
         _skip_display = False
@@ -270,8 +285,9 @@ def run_review_tui(
             )
 
             # Inline commands: "R 7.17" or "j 解成" (bare "R"/"j" prompts for query)
+            # Note: (r)ubric and (R)ecall are separate — lowercase r = rubric, uppercase R = recall
             action_stripped = action.strip()
-            if action_stripped.upper() in ("R", "RECALL") or action_stripped.upper().startswith("R ") or action_stripped.lower().startswith("recall "):
+            if action_stripped in ("R", "RECALL") or action_stripped.startswith("R ") or action_stripped.startswith("RECALL "):
                 _, _, query = action_stripped.partition(" ")
                 query = query.strip()
                 if not query:
@@ -280,7 +296,7 @@ def run_review_tui(
                     handle_recall(session, query, console)
                 _skip_display = True
                 continue
-            if action_stripped.lower() in ("j", "jump") or action_stripped.lower().startswith("j ") or action_stripped.lower().startswith("jump "):
+            if action_stripped in ("j", "jump") or action_stripped.startswith("j ") or action_stripped.startswith("jump "):
                 _, _, query = action_stripped.partition(" ")
                 query = query.strip()
                 if not query:
