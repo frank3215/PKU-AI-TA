@@ -32,6 +32,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from pathlib import Path
 from urllib.parse import quote, unquote
 
 import httpx
@@ -64,6 +65,23 @@ _SUBMITTED_AT_PATTERN = re.compile(
     re.DOTALL,
 )
 _FILE_PATH_PATTERN = re.compile(r"(?:var|const) filePath = '([^']+)'")
+# Extract all file entries from CheckWork.do's filesList: (filePk, filename)
+_CHECKWORK_FILE_PATTERN = re.compile(
+    r'CheckWork\.do\?[^"]*filePk=(\d+)[^"]*">([^<]+)</a>',
+)
+
+
+def _parse_checkwork_files(html: str) -> list[tuple[str, str]]:
+    """Parse CheckWork.do HTML to find all submitted files: [(filePk, filename), ...]."""
+    files: list[tuple[str, str]] = []
+    seen_pks: set[str] = set()
+    for m in _CHECKWORK_FILE_PATTERN.finditer(html):
+        fp = m.group(1)
+        fname = m.group(2).strip()
+        if fp not in seen_pks:
+            seen_pks.add(fp)
+            files.append((fp, fname))
+    return files
 
 
 class PKUHomeworkCrawler:
@@ -276,26 +294,38 @@ class PKUHomeworkCrawler:
 
             # Try local cache first (skip if student has multiple attempts —
             # cached file may be an older version)
-            file_bytes: bytes | None = None
-            filename = ""
-            content_type = ""
+            cached_attachments: list[Attachment] = []
             has_multiple = student.get("has_multiple_attempts", False)
             if cache_dir is not None and not has_multiple:
-                safe_name = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", student["name"])
-                for ext in (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".zip"):
-                    candidate = cache_dir / f"{student_id}_{safe_name}{ext}"
-                    if candidate.exists():
-                        file_bytes = candidate.read_bytes()
-                        filename = candidate.name
-                        content_type = _guess_mime(filename)
-                        break
-
+                safe_name = re.sub(r"[^\w一-鿿\-]", "_", student["name"])
+                cache_prefix = f"{student_id}_{safe_name}"
+                # Check assignment-specific cache dir first
+                assign_cache = cache_dir / grade_book_pk
+                if assign_cache.exists():
+                    for f in sorted(assign_cache.iterdir()):
+                        if f.name.startswith(cache_prefix) and f.is_file():
+                            try:
+                                fb = f.read_bytes()
+                                ct = _guess_mime(f.name)
+                                cached_attachments.append(Attachment(filename=f.name, content_type=ct, data=fb))
+                            except OSError:
+                                continue
+                # Fallback to shared top-level cache (legacy, cross-assignment)
+                if not cached_attachments and cache_dir.exists():
+                    for f in sorted(cache_dir.iterdir()):
+                        if f.name.startswith(cache_prefix) and f.is_file():
+                            try:
+                                fb = f.read_bytes()
+                                ct = _guess_mime(f.name)
+                                cached_attachments.append(Attachment(filename=f.name, content_type=ct, data=fb))
+                            except OSError:
+                                continue
             # Cache miss (or multiple attempts) → download from PKU
-            if file_bytes is None:
+            if not cached_attachments:
                 if verbose:
                     print(f"  → Downloading {student_id} {student['name']}...")
                 try:
-                    file_bytes, filename, content_type = self._download_student_file(
+                    downloaded_files = self._download_student_file(
                         grade_book_pk=grade_book_pk,
                         title=title,
                         user_id=student_id,
@@ -307,14 +337,36 @@ class PKUHomeworkCrawler:
                     if verbose:
                         print(f"  ✗ Download failed {student_id} {student['name']}: {e}")
                     continue
-                if file_bytes is None:
+                if not downloaded_files:
                     skip_reasons["no_file_found"] += 1
                     if verbose:
                         print(f"  ! No file found {student_id} {student['name']}")
                     continue
                 if verbose:
-                    size_kb = len(file_bytes) / 1024
-                    print(f"  ✓ Downloaded {student_id} {student['name']} — {filename} ({size_kb:.0f} KB)")
+                    for fb, fn, ct in downloaded_files:
+                        size_kb = len(fb) / 1024
+                        print(f"  ✓ Downloaded {student_id} {student['name']} — {fn} ({size_kb:.0f} KB)")
+
+                # Save downloaded files to cache (assignment-specific directory)
+                if cache_dir is not None and not has_multiple:
+                    assign_cache = cache_dir / grade_book_pk
+                    assign_cache.mkdir(parents=True, exist_ok=True)
+                    safe_name = re.sub(r"[^\w一-鿿\-]", "_", student["name"])
+                    for i, (fb, fn, ct) in enumerate(downloaded_files):
+                        ext = Path(fn).suffix if "." in fn else ".bin"
+                        if i == 0:
+                            cache_path = assign_cache / f"{student_id}_{safe_name}{ext}"
+                        else:
+                            cache_path = assign_cache / f"{student_id}_{safe_name}_{i}{ext}"
+                        if not cache_path.exists():
+                            cache_path.write_bytes(fb)
+
+            # Build attachments from cached or downloaded files
+            if cached_attachments:
+                attachments = cached_attachments
+            else:
+                # Fresh download: may have multiple files
+                attachments = [Attachment(filename=fn, content_type=ct, data=fb) for fb, fn, ct in downloaded_files]
 
             submissions.append(Submission(
                 student_id=student_id,
@@ -322,7 +374,7 @@ class PKUHomeworkCrawler:
                 assignment_id=grade_book_pk,
                 assignment_title=title,
                 bb_user_id=self._bb_user_map.get(student_id, ""),
-                attachments=[Attachment(filename=filename, content_type=content_type, data=file_bytes)],
+                attachments=attachments,
                 submitted_at=student.get("submitted_at", ""),
                 already_graded=False,
                 has_multiple_attempts=student.get("has_multiple_attempts", False),
@@ -410,12 +462,13 @@ class PKUHomeworkCrawler:
 
     def _download_student_file(
         self, grade_book_pk: str, title: str, user_id: str, file_pk: str, attempt_pk: str
-    ) -> tuple[bytes | None, str, str]:
+    ) -> list[tuple[bytes, str, str]]:
         """
-        Fetch CheckWork.do to extract filePath, then download via api/pdf.do.
-        Returns (file_bytes, filename, content_type) or (None, "", "") on failure.
+        Fetch CheckWork.do to extract all filePaths, then download via api/pdf.do.
+        Returns a list of (file_bytes, filename, content_type) tuples, or empty list on failure.
+        Supports multiple files per submission (e.g. front+back photos).
         """
-        # Step 1: fetch CheckWork.do to get the JS variable filePath
+        # Step 1: fetch CheckWork.do for the primary filePk
         url = f"{self.client.base_url or ''}{HW_BASE}/CheckWork.do"
         params = {
             "course_id": self.course_id,
@@ -428,20 +481,42 @@ class PKUHomeworkCrawler:
         resp = self.client.get(url, params=params)
         resp.raise_for_status()
 
-        m = _FILE_PATH_PATTERN.search(resp.text)
-        if not m:
-            return None, "", ""
+        # Step 2: find all files in the submission
+        all_files = _parse_checkwork_files(resp.text)  # [(filePk, filename), ...]
+        if not all_files:
+            return []
 
-        file_path = m.group(1)
-        filename = file_path.rsplit("/", 1)[-1]
-        content_type = _guess_mime(filename)
+        # Step 3: download each file
+        downloaded: list[tuple[bytes, str, str]] = []
+        for fp, fname in all_files:
+            # Get filePath for this filePk
+            if fp == file_pk:
+                # Current response already has this filePath
+                m = _FILE_PATH_PATTERN.search(resp.text)
+                if not m:
+                    continue
+                file_path = m.group(1)
+            else:
+                # Fetch CheckWork.do with this specific filePk
+                params2 = dict(params)
+                params2["filePk"] = fp
+                try:
+                    resp2 = self.client.get(url, params=params2)
+                    resp2.raise_for_status()
+                except httpx.HTTPStatusError:
+                    continue
+                m = _FILE_PATH_PATTERN.search(resp2.text)
+                if not m:
+                    continue
+                file_path = m.group(1)
 
-        # Double-encode and pass directly in URL (params= would triple-encode)
-        encoded = quote(quote(file_path, safe=""), safe="")
-        file_resp = self.client.get(f"{HW_BASE}/api/pdf.do?path={encoded}")
-        file_resp.raise_for_status()
+            # Double-encode the path and download
+            encoded = quote(quote(file_path, safe=""), safe="")
+            file_resp = self.client.get(f"{HW_BASE}/api/pdf.do?path={encoded}")
+            file_resp.raise_for_status()
+            downloaded.append((file_resp.content, fname, _guess_mime(fname)))
 
-        return file_resp.content, filename, content_type
+        return downloaded
 
     # ------------------------------------------------------------------
     # BB user map (for grade submission)
