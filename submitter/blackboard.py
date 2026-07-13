@@ -219,8 +219,10 @@ def submit_scores(
             status = "[dim]new[/dim]"
         elif float(existing) == r.final_score:
             status = "[green]same[/green]"
+        elif float(existing) < r.final_score:
+            status = f"[green]↑ {float(existing):.0f} → {r.final_score:.0f}[/green]"
         else:
-            status = f"[red]CHANGED {float(existing):.0f} → {r.final_score:.0f}[/red]"
+            status = f"[red]↓ {float(existing):.0f} → {r.final_score:.0f}[/red]"
         diff_table.add_row(
             r.result.student_id,
             r.result.student_name,
@@ -230,6 +232,17 @@ def submit_scores(
         )
     console.print(diff_table)
     console.print()
+
+    # Warn about score decreases — lowering existing grades needs extra care
+    decreased = [(r, float(existing)) for r, existing in diff_rows if existing is not None and float(existing) > r.final_score]
+    if decreased:
+        console.print("[bold red]Warning: The following students will have their scores DECREASED:[/bold red]")
+        for r, old_score in decreased:
+            console.print(f"  [red]{r.result.student_name} ({r.result.student_id}): {old_score:.0f} → {r.final_score:.0f} (↓{old_score - r.final_score:.0f})[/red]")
+        console.print()
+        if not Confirm.ask("[bold red]Really decrease these scores?[/bold red]", default=False):
+            console.print("[yellow]Upload cancelled due to score decreases.[/yellow]")
+            return
 
     if dry_run:
         for r, existing in diff_rows:
