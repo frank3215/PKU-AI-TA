@@ -21,9 +21,11 @@ from rich.table import Table
 from rich.text import Text
 from review.tui_components import (
     find_submission_file,
+    find_submission_files,
     load_review_data,
     needs_review_check,
     open_file,
+    open_files,
     auto_approve_students,
     ReviewSession,
     handle_approve,
@@ -264,10 +266,11 @@ def run_review_tui(
 
             student_id = str(row_data["student_id"])
             student_name = str(row_data["student_name"])
-            sub_file = find_submission_file(submissions, student_id, student_name, assignment_id=session.assignment_id)
+            sub_files = find_submission_files(submissions, student_id, student_name, assignment_id=session.assignment_id)
 
-            if sub_file:
-                console.print(f"[bold blue]Submission:[/bold blue] {sub_file}")
+            if sub_files:
+                for sf in sub_files:
+                    console.print(f"[bold blue]Submission:[/bold blue] {sf}")
             else:
                 console.print("[yellow]Warning: No submission file found[/yellow]")
             if rubric.exists():
@@ -300,9 +303,21 @@ def run_review_tui(
                 _, _, query = action_stripped.partition(" ")
                 query = query.strip()
                 if not query:
-                    query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]").strip()
-                if query:
-                    handle_jump(session, query, console)
+                    # Auto-jump: next unapproved entry after current position
+                    found = False
+                    for i in range(session.current_idx + 1, len(session.rows)):
+                        _, rd = session.rows[i]
+                        if str(rd.get("approved", "")).upper() != "YES":
+                            session._jump_row_data = None
+                            session.current_idx = i
+                            console.print(f"[green]Jumped to next unapproved: {rd.get('student_name')} ({rd.get('student_id')}).[/green]")
+                            found = True
+                            break
+                    if not found:
+                        console.print("[yellow]No more unapproved entries after current position.[/yellow]")
+                else:
+                    if handle_jump(session, query, console):
+                        pass
                 continue
 
             # External jump state: only allow view + notes actions
@@ -328,8 +343,8 @@ def run_review_tui(
                 handle_notes_prompt(session, row_idx, row_data, console)
             elif action in ("e", "edit"):
                 breakdown = handle_edit(session, row_idx, row_data, breakdown, console)
-            elif action in ("o", "open") and sub_file:
-                open_file(sub_file, console)
+            elif action in ("o", "open") and sub_files:
+                open_files(sub_files, console)
             elif action in ("r", "rubric"):
                 if rubric.exists():
                     open_file(rubric, console)
@@ -341,9 +356,13 @@ def run_review_tui(
                 session.append_uncertain_to_notes = not session.append_uncertain_to_notes
                 _persist_env_bool("APPEND_UNCERTAIN_TO_NOTES", session.append_uncertain_to_notes)
                 console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
-            else: # skip
+            elif action in ("s", "skip"):
                 console.print("[dim]Skipped.[/dim]")
                 session.next_student()
+            elif action == "":  # Enter with no input (Prompt default catches this, but be safe)
+                session.next_student()
+            else: # unrecognized — stay on current student
+                console.print(f"[yellow]Unrecognized action '{action}'.[/yellow]")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]\nInterrupted by user (Ctrl-C)[/yellow]")

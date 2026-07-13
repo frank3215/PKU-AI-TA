@@ -308,8 +308,22 @@ def find_submission_file(
     subdirectories (and the top-level directory) and return the most
     recently modified match.
     """
+    files = find_submission_files(submissions_dir, student_id, student_name, assignment_id)
+    return files[0] if files else None
+
+
+def find_submission_files(
+    submissions_dir: Path,
+    student_id: str,
+    student_name: str,
+    assignment_id: str | None = None,
+) -> list[Path]:
+    """Find all submission files for a student by matching student_id in filename.
+
+    Returns all matching files (e.g. front and back images). Sorted by name.
+    """
     if not submissions_dir.exists():
-        return None
+        return []
 
     matches: list[Path] = []
 
@@ -319,26 +333,25 @@ def find_submission_file(
         if exact_dir.is_dir():
             for f in exact_dir.iterdir():
                 if f.is_file() and not f.name.startswith(".") and student_id in f.name:
-                    return f  # exact hit — no need to search further
+                    matches.append(f)
 
     # 2. Fallback: search all subdirectories
-    for assignment_dir in submissions_dir.iterdir():
-        if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
-            continue
-        for f in assignment_dir.iterdir():
+    if not matches:
+        for assignment_dir in submissions_dir.iterdir():
+            if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
+                continue
+            for f in assignment_dir.iterdir():
+                if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                    matches.append(f)
+
+    # 3. Also check the top-level directory itself (only if nothing found above)
+    if not matches:
+        for f in submissions_dir.iterdir():
             if f.is_file() and not f.name.startswith(".") and student_id in f.name:
                 matches.append(f)
 
-    # 3. Also check the top-level directory itself
-    for f in submissions_dir.iterdir():
-        if f.is_file() and not f.name.startswith(".") and student_id in f.name:
-            matches.append(f)
-
-    if not matches:
-        return None
-
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return matches[0]
+    matches.sort(key=lambda p: p.name)
+    return matches
 
 
 def open_file(filepath: Path, console: Console | None = None) -> None:
@@ -364,6 +377,13 @@ def open_file(filepath: Path, console: Console | None = None) -> None:
         if console:
             console.print(f"[yellow]Warning: Could not open file ({e})[/yellow]")
             console.print(f"[dim]Please open manually: {filepath_str}[/dim]")
+
+
+def open_files(filepaths: list[Path], console: Console | None = None) -> None:
+    """Open multiple files with the default system viewer."""
+    for fp in filepaths:
+        open_file(fp, console)
+
 
 def needs_review_check(row_data: dict) -> bool:
     """Check if a student needs review even if already approved."""
@@ -574,9 +594,9 @@ def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: 
     student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
     if student_key not in _late_note_shown:
         current_notes = raw_notes
+        current_notes = _ensure_late_note(row_data, current_notes)
         if session.append_uncertain_to_notes:
             current_notes = _ensure_uncertain_notes(row_data, current_notes)
-        current_notes = _ensure_late_note(row_data, current_notes)
         _late_note_shown.add(student_key)
     else:
         current_notes = raw_notes
@@ -608,9 +628,9 @@ def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, co
     student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
     if student_key not in _late_note_shown:
         current_notes = raw_notes
+        current_notes = _ensure_late_note(row_data, current_notes)
         if session.append_uncertain_to_notes:
             current_notes = _ensure_uncertain_notes(row_data, current_notes)
-        current_notes = _ensure_late_note(row_data, current_notes)
         _late_note_shown.add(student_key)
     else:
         current_notes = raw_notes
