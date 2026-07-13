@@ -151,6 +151,7 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 | `--student-list` | File with one student ID per line (alternative to `--whitelist`) |
 | `--regrade-unapproved` | Keep approved students, regrade the rest |
 | `--threads` | Number of parallel scoring threads (default: from `.env` or 4) |
+| `--limit` | Only grade the first N submissions (0 = no limit). Useful for testing or batching. |
 | `--due-date` | Due date (ISO 8601). Auto-fetched if omitted |
 | `--log-file` | Log file path (default: `grade.log`) |
 
