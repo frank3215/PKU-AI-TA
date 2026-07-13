@@ -272,6 +272,10 @@ def grade(
     if not auto_submit:
         auto_submit = settings.auto_submit
 
+    # Auto-name output: scores_{column}.xlsx when using default name
+    if str(out) == "scores.xlsx" and column:
+        out = Path(f"scores_{column}.xlsx")
+
     # Checkpoint save/load using Excel format
     checkpoint_path = out
     all_results: list[ScoringResult] = []
@@ -472,9 +476,9 @@ def grade(
                 console.print(f"  [yellow]--limit {limit}:[/yellow] grading {len(submissions)} submission(s)")
 
             if save_dir:
-                written = _save_submissions(submissions, save_dir, col_title)
+                written = _save_submissions(submissions, save_dir, grade_book_pk)
                 skipped = len(submissions) - written
-                msg = f"  Saved files → [cyan]{save_dir / col_title}[/cyan]"
+                msg = f"  Saved files → [cyan]{save_dir / grade_book_pk}[/cyan]"
                 if skipped:
                     msg += f" ([dim]{skipped} already cached[/dim])"
                 console.print(msg)
@@ -893,6 +897,8 @@ def review(
     auto_approve: Annotated[bool, typer.Option("--auto-approve", help="Auto-approve 100-point submissions that don't need review")] = False,
     auto_skip_late: Annotated[bool, typer.Option("--auto-skip-late", help="Auto-skip students with >7d late submission (score set to 0)")] = False,
     skip_submitted: Annotated[bool, typer.Option("--skip-submitted", help="Skip students already graded on Blackboard")] = False,
+    column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID; inferred from spreadsheet if omitted")] = "",
+    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
@@ -900,30 +906,74 @@ def review(
     Press 'e' to edit individual criterion scores, 'r' to open the rubric, 'b' to go back.
 
     Use --auto-approve to automatically approve students with 100/100 and needs_review=NO.
+
+    Use --skip-submitted to check Blackboard for students who already have grades
+    online and skip them during review.
     """
     from review.tui import run_review_tui
     from config import settings as _settings
 
-    import openpyxl
     submitted_ids: set[str] | None = None
-    if skip_submitted and scores.exists():
+    if skip_submitted:
+        if not scores.exists():
+            console.print("[red]Error: --skip-submitted requires an existing scores file.[/red]")
+            raise typer.Exit(1)
+
+        # Determine column_id (gradeBookPK) from --column or spreadsheet
+        column_id = column
+        if not column_id:
+            import openpyxl
+            try:
+                wb = openpyxl.load_workbook(scores)
+                ws = wb.active
+                headers = [str(c.value or "") for c in ws[1]]
+                if "assignment_id" in headers:
+                    ai_idx = headers.index("assignment_id") + 1
+                    if ws.max_row > 1:
+                        v = ws.cell(row=2, column=ai_idx).value
+                        if v:
+                            column_id = str(v)
+            except Exception:
+                pass
+
+        if not column_id:
+            console.print("[red]Error: --skip-submitted requires --column (gradeBookPK), which could not be inferred from the spreadsheet.[/red]")
+            raise typer.Exit(1)
+
+        course_id = course or _settings.course_id
+        if not course_id:
+            console.print("[red]Error: --skip-submitted requires --course (or set COURSE_ID in .env).[/red]")
+            raise typer.Exit(1)
+
         try:
+            import httpx
+            from auth.iaaa import get_session
+            from submitter.blackboard import _fetch_student_meta
+
+            console.print("  [dim]Checking Blackboard for already-graded students…[/dim]")
+            grade_book_pk = column_id.strip("_").split("_")[0]
+            client = get_session()
+            student_meta, title = _fetch_student_meta(client, course_id, grade_book_pk)
+            console.print(f"  [dim]Found {len(student_meta)} students on Blackboard (assignment: {title}).[/dim]")
+
+            submitted_ids = set()
+            import openpyxl
             wb = openpyxl.load_workbook(scores)
             ws = wb.active
             headers = [str(c.value or "") for c in ws[1]]
-            sid_col = None
-            approved_col = None
-            for i, h in enumerate(headers):
-                if h == "student_id": sid_col = i
-                if h == "approved": approved_col = i
-            if sid_col is not None and approved_col is not None:
-                submitted_ids = set()
+            if "student_id" in headers:
+                sid_idx = headers.index("student_id")
                 for row in ws.iter_rows(min_row=2, values_only=True):
-                    if row[sid_col] and str(row[approved_col] or "").upper() == "YES":
-                        submitted_ids.add(str(row[sid_col]))
-                console.print(f"  [dim]Found {len(submitted_ids)} already-approved student(s) in Excel.[/dim]")
+                    uid = str(row[sid_idx] or "").strip()
+                    if uid and uid in student_meta and student_meta[uid].get("already_graded", False):
+                        submitted_ids.add(uid)
+
+            if submitted_ids:
+                console.print(f"  [green]Found {len(submitted_ids)} student(s) already graded on Blackboard — will skip.[/green]")
+            else:
+                console.print("  [dim]No already-graded students found on Blackboard.[/dim]")
         except Exception as e:
-            console.print(f"[yellow]Warning: Could not read approved status: {e}[/yellow]")
+            console.print(f"[yellow]Warning: Could not check Blackboard for submitted status: {e}[/yellow]")
 
     try:
         run_review_tui(
@@ -1213,9 +1263,9 @@ def batch(
         console.print(f"\n[bold]═══ Batch {batch_num} ═══[/bold]  ({len(current_batch)} student(s), {len(all_submissions)} remaining)")
 
         if save_dir:
-            written = _save_submissions(current_batch, save_dir, current_batch[0].assignment_title)
+            written = _save_submissions(current_batch, save_dir, current_batch[0].assignment_id)
             if written:
-                console.print(f"  Saved files → [cyan]{save_dir / current_batch[0].assignment_title}[/cyan]")
+                console.print(f"  Saved files → [cyan]{save_dir / current_batch[0].assignment_id}[/cyan]")
 
         # Grade the batch
         batch_results: list[ScoringResult] = []
