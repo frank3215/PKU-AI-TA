@@ -96,7 +96,7 @@ Output includes Submitted / Graded / Ungraded counts per assignment.
 If `--whitelist` is omitted, automatically reads IDs from a `student_list` file.
 
 > **Finding `--column` (assignment ID):**
-> Run `ta list` to see all assignments with their gradeBookPKs. The numeric value
+> Run `uv run python main.py list` to see all assignments with their gradeBookPKs. The numeric value
 > in the `gradeBookPK` column is what you pass to `--column`.
 
 ---
@@ -170,7 +170,7 @@ This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence
 > Navigate to any page of your course on course.pku.edu.cn. The URL contains `course_id=_98024_1` — copy that value including the underscores.
 >
 > **Finding `--column` (assignment ID):**
-> Run `ta list` to see all assignments and their gradeBookPKs, or manually:
+> Run `uv run python main.py list` to see all assignments and their gradeBookPKs, or manually:
 > go to the homework list, click **查看** next to any assignment. The URL looks like:
 > ```
 > …/getStudentWork.do?course_id=_98024_1&gradeBookPK=423829&title=第一次作业
