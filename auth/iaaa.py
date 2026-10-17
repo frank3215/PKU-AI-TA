@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import base64
 import json
+import warnings
 from typing import Optional
+
+# urllib3 InsecureRequestWarning — PKU CA not in macOS trust store, verify=False required
+warnings.filterwarnings("ignore", message=".*Unverified HTTPS request.*")
 
 import requests
 
