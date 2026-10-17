@@ -1098,6 +1098,251 @@ def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) 
     return written
 
 
+@app.command("grade-forgotten")
+def grade_forgotten(
+    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
+    rubric_dir: Annotated[Path, typer.Option(help="Directory containing rubric files named rubric_{assignment}.md")] = Path("."),
+    out_dir: Annotated[Path, typer.Option(help="Directory for output Excel files (one per assignment)")] = Path("."),
+    save_dir: Annotated[Optional[Path], typer.Option(help="Save submission files here for human review")] = Path("submissions"),
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores")] = False,
+    prompt: Annotated[Path, typer.Option(help="Default system prompt file (fallback if no per-assignment prompt)")] = Path("prompts/system_zh.md"),
+    threads: Annotated[int, typer.Option(help="Parallel scoring threads")] = 0,
+    auto_submit: Annotated[bool, typer.Option("--auto-submit", help="Auto-submit scores after grading (only works with --column)")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print what would be done without grading")] = False,
+    log_file: Annotated[Path, typer.Option(help="Log file path")] = Path("grade_forgotten.log"),
+) -> None:
+    """Find and grade late submissions (<7 days overdue) that other TAs forgot to grade.
+
+    Scans ALL assignments. For each assignment:
+      - Looks for a corresponding rubric file: rubric_{safe_name}.md
+      - Skips the assignment if no rubric is found (reports it)
+      - Finds ungraded late submissions (0 < late_days <= 7)
+      - For 第一次作业: skips students with multiple attempts
+      - Grades them and saves to a separate Excel: scores_{safe_name}.xlsx
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from threading import Lock
+    import re as _re
+
+    from auth.iaaa import get_session
+    from config import settings
+    from crawler.pku_homework import PKUHomeworkCrawler
+    from review.spreadsheet import export
+    from scorer.llm import score_submission
+    from models import ScoringResult
+
+    # Logging
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    logging.getLogger("pku_ai_ta.scorer").setLevel(logging.DEBUG)
+    console.print(f"  [dim]Logging to {log_file} (DEBUG level)[/dim]")
+
+    if threads > 0:
+        settings.ta_threads = threads
+
+    course_id = course or settings.course_id
+    if not course_id:
+        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
+        raise typer.Exit(1)
+
+    console.print("[bold]Step 1/3:[/bold] Authenticating with PKU IAAA…")
+    client = get_session()
+    crawler = PKUHomeworkCrawler(client, course_id, set())
+
+    # Get ALL assignments
+    console.print("[bold]Fetching assignment list…[/bold]")
+    columns = crawler.fetch_assignments()
+    if not columns:
+        console.print("[yellow]No assignments found.[/yellow]")
+        raise typer.Exit(0)
+    console.print(f"  Found {len(columns)} assignment(s).\n")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rubric_dir = Path(rubric_dir)
+
+    # Track results across all parallel assignments
+    results_lock = Lock()
+    summary: list[dict] = []
+
+    def _process_one(col: dict) -> dict:
+        """Grade one assignment. Returns a result dict for the summary."""
+        grade_book_pk = col.get("gradeBookPK") or col["id"].strip("_").split("_")[0]
+        col_title = col.get("name") or col["id"]
+
+        # --- Determine rubric file for this assignment ---
+        safe_name = col_title.split("为")[0].split(" ")[0].strip()
+        safe_name = _re.sub(r"[^\w一-鿿]", "_", safe_name).strip("_") or grade_book_pk
+
+        rubric_file = rubric_dir / f"rubric_{safe_name}.md"
+        if not rubric_file.exists():
+            rubric_file = rubric_dir / f"rubric_{grade_book_pk}.md"
+        if not rubric_file.exists():
+            rubric_file = rubric_dir / "rubric.md"
+        if not rubric_file.exists():
+            rubric_file = Path("rubric.md")
+
+        if not rubric_file.exists():
+            console.print(f"  [red]✗ {col_title}[/red] — no rubric")
+            return {"title": col_title, "status": "no_rubric", "graded": 0}
+
+        rubric_text = rubric_file.read_text(encoding="utf-8")
+        console.print(f"  [green]✓ {col_title}[/green] — [cyan]{rubric_file.name}[/cyan]")
+
+        # --- Fetch due date ---
+        due_dt_str = crawler.fetch_due_date(grade_book_pk, col_title)
+        if not due_dt_str:
+            console.print(f"    [yellow]No due date, skipping.[/yellow]")
+            return {"title": col_title, "status": "no_due_date", "graded": 0}
+
+        # --- Fetch submissions ---
+        submissions = crawler.fetch_submissions(
+            grade_book_pk, col_title,
+            cache_dir=save_dir, verbose=verbose,
+        )
+        if not submissions:
+            console.print(f"    [yellow]No submissions.[/yellow]")
+            return {"title": col_title, "status": "no_submissions", "graded": 0}
+
+        # Parse due date
+        due_str = due_dt_str.replace("Z", "+00:00")
+        due_dt = datetime.fromisoformat(due_str)
+        if due_dt.tzinfo is None:
+            due_dt = due_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+
+        # --- Filter: all ungraded submissions (forgotten by other TAs) ---
+        is_first_assignment = "第一次" in col_title
+        to_grade: list = []
+        for sub in submissions:
+            if sub.already_graded:
+                continue
+            if not sub.submitted_at:
+                continue
+            if is_first_assignment and sub.has_multiple_attempts:
+                continue
+            # Check late status for display only
+            sub_dt = datetime.strptime(sub.submitted_at, "%Y-%m-%d %H:%M:%S")
+            sub_dt = sub_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+            late_days = (sub_dt - due_dt).total_seconds() / 86400
+            if late_days > 0:
+                console.print(f"    [yellow]Late ({late_days:.1f}d):[/yellow] {sub.student_id} {sub.student_name}")
+            else:
+                console.print(f"    [cyan]On time:[/cyan] {sub.student_id} {sub.student_name}")
+            to_grade.append((sub, due_dt_str))
+
+        if not to_grade:
+            console.print(f"    [green]No forgotten submissions.[/green]")
+            return {"title": col_title, "status": "none_to_grade", "graded": 0}
+
+        console.print(f"    [bold]{len(to_grade)} forgotten submission(s).[/bold]")
+
+        if dry_run:
+            return {"title": col_title, "status": "dry_run", "graded": len(to_grade)}
+
+        # --- Grade them ---
+        all_results: list[ScoringResult] = []
+        save_lock = Lock()
+
+        def _save():
+            with save_lock:
+                if all_results:
+                    export(all_results, out_path)
+
+        out_name = f"scores_{safe_name}.xlsx"
+        out_path = out_dir / out_name
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console, transient=not verbose,
+        ) as progress:
+            task = progress.add_task(f"    {safe_name}", total=len(to_grade))
+            grader = DaemonThreadPoolExecutor(max_workers=settings.ta_threads)
+            try:
+                due_map = {sub.student_id: due for sub, due in to_grade}
+                futures = {grader.submit(score_submission, sub, rubric_text, prompt, settings.llm_timeout): sub for sub, _ in to_grade}
+                for future in as_completed(futures):
+                    sub = futures[future]
+                    try:
+                        result = future.result()
+                        _apply_late_penalty(result, sub, due_map.get(sub.student_id, ""), console)
+                        all_results.append(result)
+                        if verbose:
+                            console.print(
+                                f"    [green]{result.student_id:12s}[/] {result.student_name:10s} "
+                                f"→ {result.total_score:3.0f}/{result.total_max:3.0f} "
+                                f"conf={result.confidence:.2f}"
+                            )
+                        _save()
+                    except Exception as e:
+                        console.print(f"    [red]Error scoring {sub.student_id}:[/red] {e}")
+                    finally:
+                        progress.advance(task)
+            finally:
+                grader.shutdown(wait=False)
+
+        export(all_results, out_path)
+        graded = len(all_results)
+        console.print(f"    [green]Saved → {out_path} ({graded} graded)[/green]")
+
+        # Auto-submit if requested
+        if auto_submit and all_results:
+            from review.spreadsheet import load_reviewed
+            from submitter.blackboard import submit_scores
+            try:
+                records = load_reviewed(out_path)
+                approved = [r for r in records if r.approved]
+                if approved:
+                    col_id = grade_book_pk if grade_book_pk.startswith("_") else f"_{grade_book_pk}_1"
+                    console.print(f"    Auto-submitting {len(approved)} score(s)…")
+                    submit_scores(client, course_id, col_id, approved, dry_run=False)
+            except Exception as e:
+                console.print(f"    [yellow]Auto-submit skipped: {e}[/yellow]")
+
+        return {"title": col_title, "status": "graded", "graded": graded, "safe_name": safe_name}
+
+    # --- Run all assignments in parallel ---
+    assignment_threads = max(1, settings.ta_threads)
+    console.print(f"  [dim]Processing {len(columns)} assignment(s) in parallel (threads={assignment_threads})[/dim]\n")
+    from concurrent.futures import ThreadPoolExecutor as AssignPool
+    with AssignPool(max_workers=assignment_threads) as pool:
+        futures = {pool.submit(_process_one, col): col for col in columns}
+        for future in as_completed(futures):
+            try:
+                with results_lock:
+                    summary.append(future.result())
+            except Exception as e:
+                col = futures[future]
+                console.print(f"  [red]Error processing {col.get('name', '?')}:[/red] {e}")
+                with results_lock:
+                    summary.append({"title": col.get("name", "?"), "status": "error", "graded": 0})
+
+    # --- Summary ---
+    console.print("\n[bold]═══ Summary ═══[/bold]")
+    skipped_no_rubric = [s["title"] for s in summary if s["status"] == "no_rubric"]
+    skipped_other = [s["title"] for s in summary if s["status"] in ("no_due_date", "no_submissions", "none_to_grade")]
+    total_graded = sum(s["graded"] for s in summary)
+
+    if skipped_no_rubric:
+        console.print(f"  [yellow]Skipped (no rubric):[/yellow] {', '.join(skipped_no_rubric)}")
+    if skipped_other:
+        console.print(f"  [yellow]Skipped (other):[/yellow] {', '.join(skipped_other)}")
+    if total_graded:
+        console.print(f"  [green]Graded: {total_graded} forgotten late submission(s).[/green]")
+    else:
+        console.print("  [yellow]No submissions graded.[/yellow]")
+
+    if skipped_no_rubric:
+        console.print(f"\n[yellow]Hint:[/yellow] Create rubric files named [cyan]rubric_{{assignment_name}}.md[/cyan] in [cyan]{rubric_dir}[/cyan]")
+        console.print("  e.g. [cyan]rubric_第一次作业.md[/cyan], [cyan]rubric_第六次作业.md[/cyan]")
+
+
 @app.command()
 def batch(
     course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
