@@ -1,0 +1,835 @@
+"""
+Components for the interactive TUI reviewer.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import openpyxl
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+from rich.text import Text
+
+# Enable readline for better line editing (arrow keys, history, etc.)
+try:
+    import readline
+    # Optional: Configure readline for better behavior
+    readline.parse_and_bind('set editing-mode emacs')
+except ImportError:
+    # Try pyreadline3 for Windows (pip install pyreadline3)
+    try:
+        import pyreadline as readline  # type: ignore
+    except ImportError:
+        # No readline available, but input() still works on Windows
+        # Windows console has basic line editing support built-in
+        pass
+
+
+def prompt_text(prompt_label: str, default: str = "", console: Console | None = None, allow_interrupt: bool = False, multiline: bool = False) -> str:
+    """Prompt for text input using Python's built-in input() for better IME and cursor support.
+
+    This is better than rich.prompt.Prompt for:
+    - Chinese/Japanese/Korean input (IME support)
+    - Left/right arrow keys for cursor movement
+    - Proper backspace handling with multi-byte characters
+
+    If allow_interrupt is True, KeyboardInterrupt will be raised instead of returning default.
+    If multiline is True, the user can enter multiple lines; an empty line ends input.
+    """
+    # Print the prompt on its own line first to avoid readline cursor position issues
+    if console:
+        console.print(f"{prompt_label}", end="")
+        if default and not multiline:
+            console.print(f" [dim](default: {default})[/dim]", end="")
+        if multiline:
+            console.print(" [dim](multi-line, empty line to finish)[/dim]")
+        else:
+            console.print()
+    else:
+        suffix = " (multi-line, empty line to finish)" if multiline else ""
+        default_hint = f" (default: {default})" if default and not multiline else ""
+        print(f"{prompt_label}{default_hint}{suffix}")
+
+    if not multiline:
+        try:
+            result = input("> ")
+            return result.strip() if result.strip() != "" else default
+        except EOFError:
+            print()
+            return default
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            return default
+
+    # Multi-line mode: keep reading until empty line
+    lines: list[str] = []
+    if default:
+        print(default)
+
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            if allow_interrupt:
+                raise
+            break
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or default
+
+
+def edit_in_editor(initial_text: str = "", console: Console | None = None) -> str:
+    """Open an external text editor for multi-line input.
+
+    Priority:
+      1. config.editor (from .env)
+      2. $EDITOR environment variable
+      3. System fallback: nano, vim, vi, or notepad (Windows)
+
+    Falls back to prompt_text(..., multiline=True) if no editor is found
+    or the editor exits with an error.
+    """
+    import shutil
+    import tempfile
+
+    from config import settings
+
+    # Detect available editor (priority: config > $EDITOR > system fallback)
+    editor = settings.editor.strip()
+    if not editor:
+        editor = os.environ.get("EDITOR", "").strip()
+    if not editor:
+        for candidate in ("nano", "vim", "vi"):
+            if shutil.which(candidate):
+                editor = candidate
+                break
+        if not editor and sys.platform == "win32":
+            editor = "notepad"
+
+    if not editor:
+        raise RuntimeError("No text editor found (set EDITOR in .env or $EDITOR env var)")
+
+    # Write initial content to a temp file
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="pku_ta_notes_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(initial_text)
+
+        # Launch editor and wait
+        cmd = [editor, path]
+        # Handle editors passed as a single string with args (e.g. "code --wait")
+        if " " in editor and shutil.which(editor.split()[0]):
+            cmd = editor.split() + [path]
+
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(f"Editor exited with code {result.returncode}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _suggest_override_from_notes(notes: str, total_max: float) -> float | None:
+    """Extract deductions like '扣2分' from notes and compute an override score.
+
+    Returns the suggested score (total_max - sum_of_deductions) if any
+    deductions are found, otherwise None.
+    """
+    deductions = re.findall(r"扣\s*(\d+(?:\.\d+)?)\s*分", notes)
+    if not deductions:
+        return None
+    total_deduction = sum(float(d) for d in deductions)
+    return max(0.0, total_max - total_deduction)
+
+
+# Track which students have already had late note prepopulated
+# Keyed by (student_id, assignment_id) — once shown, never prepopulate again
+_late_note_shown: set[tuple[str, str]] = set()
+
+
+def _ensure_late_note(row_data: dict, notes: str) -> str:
+    """Append late submission info to notes if missing."""
+    late_days = float(row_data.get("late_days") or 0)
+    late_penalty = float(row_data.get("late_penalty") or 0)
+    if late_days <= 0:
+        return notes
+    if "晚交" in notes or "迟交" in notes or "late" in notes.lower():
+        return notes
+    # Build late note line
+    if late_days > 7:
+        late_line = f"晚交 {late_days:.1f} 天，超过 7 天限制，不予批改。"
+    else:
+        late_line = f"晚交 {late_days:.1f} 天，扣 {late_penalty:.0f} 分。"
+    if notes.strip():
+        return notes.rstrip("\n") + "\n" + late_line
+    return late_line
+
+
+def _ensure_uncertain_notes(row_data: dict, notes: str) -> str:
+    """Append uncertain parts summary to notes if missing."""
+    raw_uncertain = row_data.get("uncertain_parts_json", "")
+    if not raw_uncertain:
+        return notes
+    try:
+        uncertain = json.loads(raw_uncertain)
+    except (json.JSONDecodeError, TypeError):
+        return notes
+    if not uncertain:
+        return notes
+    # Check if already appended
+    if "--- Uncertain Parts ---" in notes or "--- 不确定项 ---" in notes:
+        return notes
+    lines = ["", "--- Uncertain Parts ---"]
+    for item in uncertain:
+        desc = str(item.get("description", "") or "")
+        sug = item.get("suggested_score", 0)
+        mx = item.get("suggested_max", 0)
+        lines.append(f"- {desc} (suggested: {sug}/{mx})")
+    if notes.strip():
+        return notes.rstrip("\n") + "\n".join(lines)
+    return "\n".join(lines).lstrip("\n")
+
+
+def _maybe_offer_full_score(
+    session: ReviewSession,
+    row_idx: int,
+    row_data: dict,
+    console: Console,
+) -> None:
+    """If notes are empty and score is not full, offer to override to full score."""
+    notes = str(row_data.get("reviewer_notes") or "").strip()
+    if notes:
+        return
+    total_max = float(row_data.get("total_max", 0) or 0)
+    if total_max <= 0:
+        return
+    current_override = row_data.get("reviewer_override_score")
+    override_val = float(current_override) if current_override not in (None, "") else None
+    if override_val is not None and abs(override_val - total_max) < 0.01:
+        return
+    total_score = float(row_data.get("total_score", 0) or 0)
+    if abs(total_score - total_max) < 0.01:
+        return
+    if Confirm.ask(
+        f"[bold cyan]Notes are empty. Override score to full ({total_max:.0f})?[/bold cyan]",
+        default=True,
+    ):
+        row_data["reviewer_override_score"] = total_max
+        session.ws.cell(row=row_idx, column=session.idx["reviewer_override_score"] + 1, value=total_max)
+        session.update_row(row_idx, row_data)
+        console.print(f"[green]Override score set to {total_max:.0f}. Use (a) to approve.[/green]")
+
+
+def _maybe_offer_override(
+    session: ReviewSession,
+    row_idx: int,
+    row_data: dict,
+    console: Console,
+    notes: str,
+) -> None:
+    """After notes are saved, scan for deductions and offer an override score."""
+    total_max = float(row_data.get("total_max", 100) or 100)
+    current_score = float(row_data.get("total_score", 0) or 0)
+    suggested = _suggest_override_from_notes(notes, total_max)
+    if suggested is None:
+        return
+
+    # Determine the effective current score (override takes precedence)
+    current_override = row_data.get("reviewer_override_score")
+    if current_override is not None and current_override != "":
+        try:
+            effective_score = float(current_override)
+        except (ValueError, TypeError):
+            effective_score = current_score
+    else:
+        effective_score = current_score
+
+    # If suggested score matches effective score, no need to override
+    if abs(suggested - effective_score) <= 0.01:
+        return
+
+    override_label = "update override" if (current_override is not None and current_override != "") else "set override"
+    console.print(
+        f"\n[dim]Detected {int(total_max - suggested)} point(s) of deductions in notes. "
+        f"Current score: {effective_score:.1f}, "
+        f"suggested: [bold cyan]{suggested:.1f}[/bold cyan][/dim]"
+    )
+    if Confirm.ask(f"[bold cyan]{override_label.capitalize()} score?[/bold cyan]", default=True):
+        row_data["reviewer_override_score"] = suggested
+        session.ws.cell(
+            row=row_idx,
+            column=session.idx["reviewer_override_score"] + 1,
+            value=suggested,
+        )
+        session.update_row(row_idx, row_data)
+        console.print(f"[green]Override score set to {suggested:.1f}. Use (a) to approve.[/green]")
+
+
+def prompt_choice(prompt_label: str, choices: list[str], default: str | None = None, console: Console | None = None) -> str:
+    """Prompt for a choice from a list using rich.prompt.Prompt.
+
+    This is fine for simple menu selections where no text editing is needed.
+    """
+    return Prompt.ask(prompt_label, choices=choices, default=default)
+
+
+def find_submission_file(
+    submissions_dir: Path,
+    student_id: str,
+    student_name: str,
+    assignment_id: str | None = None,
+) -> Path | None:
+    """Find submission file for a student by matching student_id in filename.
+
+    If *assignment_id* is provided, only search inside
+    ``submissions_dir / assignment_id``.  Otherwise fall back to all
+    subdirectories (and the top-level directory) and return the most
+    recently modified match.
+    """
+    if not submissions_dir.exists():
+        return None
+
+    matches: list[Path] = []
+
+    # 1. Prefer exact assignment directory when we know it
+    if assignment_id:
+        exact_dir = submissions_dir / assignment_id
+        if exact_dir.is_dir():
+            for f in exact_dir.iterdir():
+                if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                    return f  # exact hit — no need to search further
+
+    # 2. Fallback: search all subdirectories
+    for assignment_dir in submissions_dir.iterdir():
+        if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
+            continue
+        for f in assignment_dir.iterdir():
+            if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                matches.append(f)
+
+    # 3. Also check the top-level directory itself
+    for f in submissions_dir.iterdir():
+        if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+            matches.append(f)
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
+
+
+def open_file(filepath: Path, console: Console | None = None) -> None:
+    """Open file with default system viewer. Cross-platform support."""
+    import shutil
+    filepath_str = str(filepath)
+    try:
+        if sys.platform == "darwin":  # macOS
+            subprocess.run(["open", filepath_str], check=False)
+        elif sys.platform == "win32":  # Windows
+            os.startfile(filepath_str)  # type: ignore
+        else:  # Linux / Unix variants
+            # Try openers in order of preference, checking if they exist first
+            for opener in ["xdg-open", "gio", "gnome-open", "kde-open"]:
+                if shutil.which(opener):
+                    try:
+                        subprocess.run([opener, filepath_str], check=False,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+                    except Exception:
+                        continue
+    except Exception as e:
+        if console:
+            console.print(f"[yellow]Warning: Could not open file ({e})[/yellow]")
+            console.print(f"[dim]Please open manually: {filepath_str}[/dim]")
+
+def needs_review_check(row_data: dict) -> bool:
+    """Check if a student needs review even if already approved."""
+    # Check if score is perfect (consider override if present)
+    total_max = float(row_data.get("total_max", 100) or 100)
+    override_score = row_data.get("reviewer_override_score")
+    if override_score is not None and override_score != "":
+        try:
+            current_score = float(override_score)
+        except (ValueError, TypeError):
+            current_score = float(row_data.get("total_score", 0) or 0)
+    else:
+        current_score = float(row_data.get("total_score", 0) or 0)
+    has_notes = bool(str(row_data.get("reviewer_notes") or "").strip())
+    # Needs review if not perfect score and no notes, even if approved
+    return current_score < total_max and not has_notes
+
+def load_review_data(
+    scores: Path,
+    needs_review_only: bool,
+    all_students: bool,
+    filter_ids: set[str] | None = None,
+) -> tuple[Any, dict, list[tuple[int, dict]]]:
+    """Load student data from scores spreadsheet and filter based on review status."""
+    wb = openpyxl.load_workbook(scores)
+    ws = wb.active
+
+    headers = [cell.value for cell in ws[1]]
+    idx = {name: i for i, name in enumerate(headers)}
+
+    rows: list[tuple[int, dict]] = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row[idx["student_id"]]:
+            continue
+        row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+        if filter_ids and str(row_data.get("student_id")) not in filter_ids:
+            continue
+        if needs_review_only and row_data.get("needs_review") != "YES":
+            continue
+        # Skip approved students only if they don't need review for missing notes
+        is_approved = str(row_data.get("approved", "")).upper() == "YES"
+        if not all_students and is_approved and not needs_review_check(row_data):
+            continue
+        rows.append((row_idx, row_data))
+
+    return wb, idx, rows
+
+def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
+    """Auto-approve students with perfect scores who don't need review."""
+    auto_approved = 0
+    modified = False
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row[idx["student_id"]]:
+            continue
+        row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+        # Check: 100 points, needs_review=NO, not already approved
+        total_score = float(row_data.get("total_score", 0) or 0)
+        total_max = float(row_data.get("total_max", 100) or 100)
+        needs_review = row_data.get("needs_review") == "YES"
+        already_approved = str(row_data.get("approved", "")).upper() == "YES"
+
+        if total_score == 100.0 and total_max == 100.0 and not needs_review and not already_approved:
+            student_name = row_data.get("student_name", "")
+            student_id = row_data.get("student_id", "")
+            console.print(f"  [dim]Auto-approving:[/dim] {student_name} ({student_id}) — {total_score}/{total_max}")
+            ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+            auto_approved += 1
+            modified = True
+
+    if auto_approved > 0:
+        console.print(f"[green]Auto-approved {auto_approved} student(s) with perfect scores.[/green]")
+    
+    return modified
+
+class ReviewSession:
+    """Manages the state of an interactive review session."""
+    def __init__(self, scores: Path, needs_review_only: bool, all_students: bool, filter_ids: set[str] | None = None, append_uncertain: bool = False):
+        self.scores = scores
+        self.wb, self.idx, self.rows = load_review_data(scores, needs_review_only, all_students, filter_ids)
+        self.ws = self.wb.active
+        self.current_idx = 0
+        self.modified_rows: dict[int, dict] = {}
+        self.modified = False
+        self.append_uncertain_to_notes = append_uncertain
+        # Set by handle_jump when jumping to a student outside the review queue
+        self._jump_row_data: dict | None = None
+        self._jump_row_idx: int = -1
+
+        # Infer assignment_id from the first row of the spreadsheet so we can
+        # locate the correct submission directory.
+        self.assignment_id: str | None = None
+        if self.rows:
+            _, first_row_data = self.rows[0]
+            self.assignment_id = str(first_row_data.get("assignment_id") or "").strip() or None
+
+    def get_current_row(self) -> tuple[int, dict] | None:
+        if 0 <= self.current_idx < len(self.rows):
+            row_idx, row_data_original = self.rows[self.current_idx]
+            row_data = self.modified_rows.get(row_idx, row_data_original.copy())
+            return row_idx, row_data
+        return None
+
+    def next_student(self):
+        self.current_idx += 1
+
+    def prev_student(self):
+        if self.current_idx > 0:
+            self.current_idx -= 1
+
+    def update_row(self, row_idx: int, row_data: dict):
+        self.modified_rows[row_idx] = row_data
+        self.modified = True
+
+    def save_changes(self):
+        if self.modified:
+            self.wb.save(self.scores)
+
+def handle_approve(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> bool:
+    """Handle the 'approve' action. Returns True if approved, False if cancelled."""
+    total_max = float(row_data.get("total_max", 100) or 100)
+    override_score = row_data.get("reviewer_override_score")
+    if override_score is not None and override_score != "":
+        try:
+            current_score = float(override_score)
+        except (ValueError, TypeError):
+            current_score = float(row_data.get("total_score", 0) or 0)
+    else:
+        current_score = float(row_data.get("total_score", 0) or 0)
+    is_perfect = current_score >= total_max
+    has_notes = bool(str(row_data.get("reviewer_notes") or "").strip())
+
+    if not is_perfect and not has_notes:
+        console.print("\n[yellow]Score is not 100%. Please add reviewer notes.[/yellow]")
+        current_notes = str(row_data.get("reviewer_notes") or "")
+        try:
+            new_notes = edit_in_editor(initial_text=current_notes, console=console)
+        except RuntimeError:
+            # Fallback to built-in multiline prompt if no editor available
+            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Approve cancelled.[/yellow]")
+            return False
+        if new_notes.strip():
+            row_data["reviewer_notes"] = new_notes
+            session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=new_notes)
+            has_notes = True
+            console.print("[green]Added reviewer notes.[/green]")
+        else:
+            console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
+
+    # Consistency check: breakdown sum must equal total score (unless overridden)
+    has_override = override_score is not None and override_score != ""
+    if not has_override:
+        import json
+        raw_bd = row_data.get("breakdown_json")
+        if raw_bd:
+            try:
+                breakdown = json.loads(raw_bd)
+                breakdown_sum = 0.0
+                for b in breakdown:
+                    pa = b.get("points_awarded")
+                    if pa is None:
+                        pa = 0.0
+                    breakdown_sum += float(pa)
+                total_score_raw = float(row_data.get("total_score", 0) or 0)
+                lp = float(row_data.get("late_penalty") or 0)
+                # Match if: (1) late penalty is in breakdown (bd_sum == total_raw)
+                #           (2) late penalty is NOT in breakdown (bd_sum == total_raw + lp)
+                if abs(breakdown_sum - total_score_raw) > 0.01 and (lp <= 0 or abs(breakdown_sum - (total_score_raw + lp)) > 0.01):
+                    console.print(
+                        f"\n[red]Score inconsistency detected:[/red] "
+                        f"breakdown sum = [yellow]{breakdown_sum:.1f}[/yellow], "
+                        f"total_score = [yellow]{total_score_raw:.1f}[/yellow] "
+                        f"(diff = [red]{breakdown_sum - total_score_raw:+.1f}[/red])"
+                    )
+                    if lp > 0:
+                        console.print(f"[dim]Late penalty {lp:.0f}pt not accounted for in breakdown.[/dim]")
+                    console.print("[dim]Use [bold](ov) override[/bold] to set a manual score before approving.[/dim]")
+                    return False
+            except json.JSONDecodeError:
+                console.print("[red]Error: breakdown_json is malformed. Cannot verify score consistency.[/red]")
+                console.print("[dim]Use [bold](ov) override[/bold] to approve with a manual score, or (e)dit to fix breakdown.[/dim]")
+                return False
+            except (ValueError, TypeError) as e:
+                console.print(f"[red]Error: Invalid value in breakdown ({e}). Cannot verify score consistency.[/red]")
+                console.print("[dim]Use [bold](ov) override[/bold] to approve with a manual score.[/dim]")
+                return False
+
+    # Ask before clearing reviewer notes for perfect scores
+    if is_perfect and has_notes:
+        console.print(f"\n[dim]Current notes:[/dim] {row_data['reviewer_notes']}")
+        if Confirm.ask("[bold cyan]Clear reviewer notes for this perfect score?[/bold cyan]", default=True):
+            row_data["reviewer_notes"] = ""
+            session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value="")
+            console.print("[dim]Cleared reviewer notes.[/dim]")
+        else:
+            console.print("[dim]Kept reviewer notes.[/dim]")
+
+    session.ws.cell(row=row_idx, column=session.idx["approved"] + 1, value="YES")
+    row_data["approved"] = "YES"
+    session.update_row(row_idx, row_data)
+    console.print("[green]Marked as approved.[/green]")
+    return True
+
+def handle_notes(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
+    """Handle the 'notes' action (n). Opens an external editor for multi-line input."""
+    raw_notes = str(row_data.get("reviewer_notes") or "")
+    student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
+    if student_key not in _late_note_shown:
+        current_notes = raw_notes
+        if session.append_uncertain_to_notes:
+            current_notes = _ensure_uncertain_notes(row_data, current_notes)
+        current_notes = _ensure_late_note(row_data, current_notes)
+        _late_note_shown.add(student_key)
+    else:
+        current_notes = raw_notes
+    console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
+    try:
+        new_notes = edit_in_editor(initial_text=current_notes, console=console)
+    except RuntimeError:
+        # Fallback to built-in multiline prompt if no editor available
+        try:
+            new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
+            return
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
+        return
+    row_data["reviewer_notes"] = new_notes
+    session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=new_notes)
+    session.update_row(row_idx, row_data)
+    console.print("[green]Updated reviewer notes.[/green]")
+    _maybe_offer_override(session, row_idx, row_data, console, new_notes)
+
+    _maybe_offer_full_score(session, row_idx, row_data, console)
+
+
+def handle_notes_prompt(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
+    """Handle the 'notes text' action (T). Uses built-in multiline prompt (no editor)."""
+    raw_notes = str(row_data.get("reviewer_notes") or "")
+    student_key = (str(row_data.get("student_id", "")), str(row_data.get("assignment_id", "")))
+    if student_key not in _late_note_shown:
+        current_notes = raw_notes
+        if session.append_uncertain_to_notes:
+            current_notes = _ensure_uncertain_notes(row_data, current_notes)
+        current_notes = _ensure_late_note(row_data, current_notes)
+        _late_note_shown.add(student_key)
+    else:
+        current_notes = raw_notes
+    console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
+    try:
+        new_notes = prompt_text("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes, console=console, allow_interrupt=True, multiline=True)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled - notes not changed.[/yellow]")
+        return
+    row_data["reviewer_notes"] = new_notes
+    session.ws.cell(row=row_idx, column=session.idx["reviewer_notes"] + 1, value=new_notes)
+    session.update_row(row_idx, row_data)
+    console.print("[green]Updated reviewer notes.[/green]")
+    _maybe_offer_override(session, row_idx, row_data, console, new_notes)
+
+    _maybe_offer_full_score(session, row_idx, row_data, console)
+
+
+def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown: list, console: Console) -> list:
+    """Handle the 'edit' action."""
+    if not breakdown:
+        console.print("[yellow]No breakdown data to edit[/yellow]")
+        return breakdown
+    breakdown, new_total, new_max = edit_breakdown(console, breakdown)
+    # Update the row data
+    row_data["breakdown_json"] = json.dumps(breakdown)
+    row_data["total_score"] = new_total
+    row_data["total_max"] = new_max
+    row_data["pct"] = round((new_total / new_max) * 100, 1) if new_max > 0 else 0
+    # Update Excel
+    session.ws.cell(row=row_idx, column=session.idx["breakdown_json"] + 1, value=row_data["breakdown_json"])
+    session.ws.cell(row=row_idx, column=session.idx["total_score"] + 1, value=new_total)
+    session.ws.cell(row=row_idx, column=session.idx["total_max"] + 1, value=new_max)
+    session.ws.cell(row=row_idx, column=session.idx["pct"] + 1, value=row_data["pct"])
+    session.update_row(row_idx, row_data)
+    console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
+    return breakdown
+
+
+def _persist_env_bool(key: str, value: bool) -> None:
+    """Update a boolean setting in .env, preserving comments and layout."""
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    line = f"{key.upper()}={str(value).lower()}"
+    text = env_path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{key.upper()}\s*=\s*(true|false)", re.IGNORECASE | re.MULTILINE)
+    if pattern.search(text):
+        text = pattern.sub(line, text)
+    else:
+        text = text.rstrip("\n") + "\n" + line + "\n"
+    env_path.write_text(text, encoding="utf-8")
+
+
+def handle_recall(session: ReviewSession, query: str, console: Console) -> None:
+    """Search approved students' reviewer_notes for lines matching query.
+
+    Outputs in format: 学号_学生名: matching line
+    """
+    import re as _re
+
+    ws = session.ws
+    idx = session.idx
+    header_row = list(ws.iter_rows(min_row=1, max_row=1))[0]
+    headers = [str(c.value or "") for c in header_row]
+    col_idx = {name: i for i, name in enumerate(headers)}
+
+    notes_col = col_idx.get("reviewer_notes")
+    sid_col = col_idx.get("student_id")
+    name_col = col_idx.get("student_name")
+
+    if any(c is None for c in (notes_col, sid_col, name_col)):
+        console.print("[red]Required columns not found in spreadsheet.[/red]")
+        return
+
+    pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
+    results: list[str] = []
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not row[sid_col]:
+            continue
+        sid = str(row[sid_col] or "").strip()
+        sname = str(row[name_col] or "").strip()
+        notes = str(row[notes_col] or "")
+        if not notes:
+            continue
+
+        for line in notes.split("\n"):
+            line = line.strip()
+            if line and pattern.search(line):
+                results.append(f"{sid}_{sname}: {line}")
+
+    if results:
+        from rich.table import Table as RichTable
+        t = RichTable(title=f"Recall: '{query}' ({len(results)} match(es))", box=None, expand=True)
+        t.add_column("Match", overflow="fold")
+        for r in results:
+            t.add_row(r)
+        console.print(t)
+    else:
+        console.print(f"[yellow]No matches for '{query}' in approved records.[/yellow]")
+
+
+def handle_override(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
+    """Handle the 'override' action. Sets override score and stays on current student."""
+    current_override = row_data.get("reviewer_override_score", "")
+    if current_override:
+        console.print(f"\n[bold]Current override:[/bold] {current_override}")
+    new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]", default=str(current_override) if current_override else "")
+    if new_score:
+        try:
+            score_val = float(new_score)
+            row_data["reviewer_override_score"] = score_val
+            session.ws.cell(row=row_idx, column=session.idx["reviewer_override_score"] + 1, value=score_val)
+            session.update_row(row_idx, row_data)
+            console.print(f"[green]Override score set to {score_val}. Use (a) to approve.[/green]")
+        except ValueError:
+            console.print("[red]Invalid score[/red]")
+
+
+def handle_jump(session: ReviewSession, query: str, console: Console) -> bool:
+    """Jump to a student matching name or ID. Searches entire worksheet."""
+    q = query.strip().lower()
+    # First try the current queue
+    for i, (row_idx, row_data) in enumerate(session.rows):
+        sid = str(row_data.get("student_id", "") or "").lower()
+        sname = str(row_data.get("student_name", "") or "").lower()
+        if q in sid or q in sname:
+            session._jump_row_data = None  # clear any external jump
+            session.current_idx = i
+            console.print(f"[green]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}).[/green]")
+            return True
+
+    # Not in queue → search entire worksheet
+    ws = session.ws
+    headers = [str(c.value or "") for c in ws[1]]
+    col_idx = {name: i for i, name in enumerate(headers)}
+    for row_obj in ws.iter_rows(min_row=2):
+        row_cells = [c.value for c in row_obj]
+        if not any(row_cells):
+            continue
+        sid = str(row_cells[col_idx.get("student_id", 0)] or "").lower()
+        sname = str(row_cells[col_idx.get("student_name", 1)] or "").lower()
+        if q in sid or q in sname:
+            excel_row = row_obj[0].row  # actual Excel row number
+            row_data = {name: row_cells[i] if i < len(row_cells) else None for name, i in col_idx.items()}
+            session._jump_row_data = row_data
+            session._jump_row_idx = excel_row
+            console.print(f"[yellow]Jumped to {row_data.get('student_name')} ({row_data.get('student_id')}) [outside review queue].[/yellow]")
+            return True
+
+    console.print(f"[yellow]No student matching '{query}' found.[/yellow]")
+    return False
+
+
+def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, float]:
+    """Interactive editor for breakdown. Returns (new_breakdown, new_total, new_max)."""
+    while True:
+        console.print()
+        console.print(Panel("[bold]Edit Criterion Scores[/bold]\n"
+                           "Enter the number of the criterion to edit, or 'd' when done",
+                           border_style="magenta"))
+
+        # Show current breakdown with numbers
+        bd_table = Table()
+        bd_table.add_column("#", style="dim", justify="right")
+        bd_table.add_column("Criterion", style="cyan")
+        bd_table.add_column("Awarded", justify="right", style="green")
+        bd_table.add_column("Max", justify="right")
+        for i, item in enumerate(breakdown, start=1):
+            awarded = float(item.get("points_awarded", 0))
+            max_p = float(item.get("points_max", 0))
+            style = "red" if awarded < max_p else "green"
+            # Bold the number for incorrect items so they stand out
+            if awarded < max_p:
+                bd_table.add_row(
+                    Text(str(i), style="bold underline red"),
+                    Text(str(item.get("criterion", "")), style="underline"),
+                    Text(f"{awarded}", style="underline red"),
+                    Text(f"{max_p}", style="underline"),
+                )
+            else:
+                bd_table.add_row(
+                    Text(str(i)),
+                    str(item.get("criterion", "")),
+                    Text(f"{awarded}", style=style),
+                    f"{max_p}",
+                )
+        console.print(bd_table)
+
+        # Calculate and show current total
+        current_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
+        current_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+        console.print(f"\n[bold]Current Total:[/bold] {current_total} / {current_max}")
+        console.print()
+
+        choice = Prompt.ask("[bold magenta]Criterion # to edit, or [d]one[/bold magenta]",
+                           choices=[str(i) for i in range(1, len(breakdown) + 1)] + ["d", "done"],
+                           default="d")
+
+        if choice.lower() in ("d", "done"):
+            new_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
+            new_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+            return breakdown, new_total, new_max
+
+        # Edit selected criterion
+        idx = int(choice) - 1
+        item = breakdown[idx]
+        console.print(f"\n[bold]Editing:[/bold] {item.get('criterion', '')}")
+        console.print(f"  Current: {item.get('points_awarded', 0)} / {item.get('points_max', 0)}")
+        console.print(f"  Reasoning: {item.get('reasoning', '')}")
+
+        new_score = Prompt.ask(f"  New score (0-{item.get('points_max', 0)})",
+                              default=str(item.get("points_awarded", 0)))
+        try:
+            score_val = float(new_score)
+            max_val = float(item.get("points_max", 0))
+            if 0 <= score_val <= max_val:
+                item["points_awarded"] = score_val
+                console.print(f"[green]Updated to {score_val} / {max_val}[/green]")
+            else:
+                console.print(f"[red]Score must be between 0 and {max_val}[/red]")
+        except ValueError:
+            console.print("[red]Invalid number[/red]")

@@ -1,0 +1,345 @@
+"""
+Interactive TUI for reviewing submissions one by one.
+
+Shows score breakdown, opens submission file, and lets you approve or override scores.
+Press 'e' to edit individual criterion scores, 'r' to open the rubric, 'b' to go back.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+import openpyxl
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+from rich.text import Text
+from review.tui_components import (
+    find_submission_file,
+    load_review_data,
+    needs_review_check,
+    open_file,
+    auto_approve_students,
+    ReviewSession,
+    handle_approve,
+    handle_edit,
+    handle_notes,
+    handle_notes_prompt,
+    handle_override,
+    handle_recall,
+    handle_jump,
+    _persist_env_bool,
+)
+
+
+def display_student(console: Console, row_data: dict, row_idx: int, total: int, breakdown: list | None = None) -> list:
+    """Display student info and score breakdown using Rich. Returns the breakdown list."""
+    console.print()
+    console.print(Panel.fit(
+        f"[bold cyan]Student {row_idx}/{total}[/bold cyan]",
+        title="Review Progress",
+        border_style="blue"
+    ))
+    info_table = Table(show_header=False, box=None, expand=True)
+    info_table.add_column(style="bold", no_wrap=True, width=20)
+    info_table.add_column(overflow="fold", min_width=40)
+    info_table.add_row("Student ID:", str(row_data["student_id"]))
+    info_table.add_row("Name:", str(row_data["student_name"]))
+
+    # Show override score if present
+    override_score = row_data.get("reviewer_override_score")
+    if override_score is not None and override_score != "":
+        try:
+            override_val = float(override_score)
+            total_max = float(row_data["total_max"])
+            override_pct = round((override_val / total_max) * 100, 1) if total_max > 0 else 0
+            info_table.add_row("Score:", f"[red][strike]{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)[/strike][/red]")
+            info_table.add_row("Override:", f"[green]{override_val} / {total_max} ({override_pct}%)[/green]")
+        except (ValueError, TypeError):
+            info_table.add_row("Score:", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+    else:
+        info_table.add_row("Score:", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+
+    info_table.add_row("Confidence:", f"{row_data['confidence']}")
+    processing_notes = str(row_data.get("processing_notes") or "")
+    if processing_notes:
+        mode_color = "cyan" if processing_notes == "text" else "magenta"
+        info_table.add_row("Processing mode:", f"[{mode_color}]{processing_notes}[/{mode_color}]")
+
+    # Late submission info
+    late_days = float(row_data.get("late_days") or 0)
+    late_penalty = float(row_data.get("late_penalty") or 0)
+    if late_days > 0:
+        if late_days > 7:
+            late_msg = f"[red]Late {late_days:.1f} day(s), no grade (>7d limit)[/red]"
+        else:
+            late_msg = f"[yellow]Late {late_days:.1f} day(s), penalty {late_penalty:.0f}pt[/yellow]"
+        info_table.add_row("Late submission:", late_msg)
+
+    # Consistency check: breakdown sum vs total_score (accounting for late penalty)
+    consistency_msg = ""
+    try:
+        bd_check = json.loads(row_data.get("breakdown_json", "[]") or "[]") if row_data.get("breakdown_json") else []
+        if bd_check:
+            bd_sum = sum(float(b.get("points_awarded", 0) or 0) for b in bd_check)
+            total_raw = float(row_data.get("total_score", 0) or 0)
+            lp = float(row_data.get("late_penalty") or 0)
+            # Match if: (1) late penalty is in breakdown (bd_sum == total_raw)
+            #           (2) late penalty is NOT in breakdown (bd_sum == total_raw + lp)
+            if abs(bd_sum - total_raw) > 0.01 and (lp <= 0 or abs(bd_sum - (total_raw + lp)) > 0.01):
+                consistency_msg = f"[red]INCONSISTENT: breakdown sum = {bd_sum:.1f}, total = {total_raw:.1f}[/red]"
+                if lp > 0:
+                    consistency_msg += f" (late penalty {lp:.0f}pt not accounted for)"
+    except (json.JSONDecodeError, ValueError, TypeError):
+        consistency_msg = "[yellow]Warning: Could not verify score consistency[/yellow]"
+    if consistency_msg:
+        info_table.add_row("Consistency:", consistency_msg)
+
+    info_table.add_row("Needs review:", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
+    info_table.add_row("Current approved:", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
+    current_notes = str(row_data.get("reviewer_notes") or "")
+    if current_notes:
+        info_table.add_row("Reviewer notes:", f"[green]{current_notes}[/green]")
+    else:
+        info_table.add_row("Reviewer notes:", "[dim][yellow](none)[/yellow][/dim]")
+    console.print(Panel(info_table, title="Student Info", border_style="cyan"))
+
+    if breakdown is None:
+        try:
+            breakdown = json.loads(row_data.get("breakdown_json", "[]"))
+        except json.JSONDecodeError:
+            breakdown = []
+            console.print("[yellow]Warning: Could not parse breakdown_json[/yellow]")
+
+    if breakdown:
+        bd_table = Table(title="Score Breakdown", expand=True)
+        bd_table.add_column("#", style="dim", justify="right", no_wrap=True, width=3)
+        bd_table.add_column("Criterion", style="cyan", no_wrap=True, min_width=15, max_width=25)
+        bd_table.add_column("Awarded", justify="right", style="green", no_wrap=True, width=8)
+        bd_table.add_column("Max", justify="right", no_wrap=True, width=6)
+        bd_table.add_column("Reasoning", style="dim", overflow="fold", min_width=40)
+        for i, item in enumerate(breakdown, start=1):
+            awarded = float(item.get("points_awarded", 0))
+            max_p = float(item.get("points_max", 0))
+            style = "red" if awarded < max_p else "green"
+            reasoning = str(item.get("reasoning", ""))
+            # Truncate reasoning for perfect-score items to save space
+            if awarded >= max_p:
+                truncated = reasoning[:80] + "..." if len(reasoning) > 80 else reasoning
+                reasoning_text = Text(truncated, style="dim")
+            else:
+                reasoning_text = Text(reasoning, style="dim")
+            bd_table.add_row(
+                str(i),
+                str(item.get("criterion", "")),
+                Text(f"{awarded}", style=style),
+                f"{max_p}",
+                reasoning_text
+            )
+        console.print(Panel(bd_table, border_style="green"))
+
+    try:
+        uncertain = json.loads(row_data.get("uncertain_parts_json", "[]"))
+        if uncertain:
+            uc_table = Table(title="Uncertain Parts")
+            uc_table.add_column("Description", style="yellow")
+            uc_table.add_column("Suggested Score", justify="right")
+            for item in uncertain:
+                uc_table.add_row(
+                    str(item.get("description", "")),
+                    f"{item.get('suggested_score', 0)} / {item.get('suggested_max', 0)}"
+                )
+            console.print(Panel(uc_table, border_style="yellow"))
+    except json.JSONDecodeError:
+        pass
+
+    if row_data.get("llm_reasoning"):
+        console.print(Panel(
+            Text(str(row_data["llm_reasoning"]), style="dim"),
+            title="LLM Reasoning",
+            border_style="dim"
+        ))
+
+    return breakdown
+
+
+def _bottom_bar(console: Console, text: str = "") -> None:
+    """Draw a separator line and prompt at the terminal bottom.
+
+    Uses ANSI absolute positioning.  Call after rendering student content.
+    After this, the cursor sits on the last line where Prompt.ask will appear.
+    """
+    h = shutil.get_terminal_size().lines
+    cols = shutil.get_terminal_size().columns
+    # Draw separator on second-last line
+    sys.stdout.write(f"\033[{h-1};1H")
+    sys.stdout.write("─" * cols)
+    # Position cursor on last line for the prompt
+    sys.stdout.write(f"\033[{h};1H> ")
+    sys.stdout.flush()
+
+
+def run_review_tui(
+    console: Console,
+    scores: Path,
+    submissions: Path = Path("submissions"),
+    rubric: Path = Path("rubric.md"),
+    needs_review_only: bool = False,
+    all_students: bool = False,
+    auto_approve: bool = False,
+    filter_ids: set[str] | None = None,
+    append_uncertain: bool = False,
+) -> None:
+    """Interactive TUI for reviewing submissions one by one."""
+    if not scores.exists():
+        console.print(f"[red]Error:[/red] Scores file not found: {scores}")
+        raise FileNotFoundError(f"Scores file not found: {scores}")
+
+    if rubric.exists():
+        console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
+    else:
+        console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
+
+    console.print(f"Loading spreadsheet: {scores}")
+    session = ReviewSession(scores, needs_review_only, all_students, filter_ids, append_uncertain)
+
+    if not session.rows:
+        console.print("[yellow]No students to review with the current filters.[/yellow]")
+        return
+
+    console.print(f"[green]Found {len(session.rows)} student(s) to review.[/green]")
+
+    if auto_approve:
+        if auto_approve_students(session.ws, session.idx, console):
+            # Save the changes before reloading
+            session.wb.save(scores)
+            session = ReviewSession(scores, needs_review_only, all_students, append_uncertain=append_uncertain)
+            console.print(f"[green]{len(session.rows)} student(s) remaining to review after auto-approve.[/green]")
+
+    try:
+        _skip_display = False
+        while True:
+            if session._jump_row_data is not None:
+                row_idx, row_data = session._jump_row_idx, session._jump_row_data
+            else:
+                current_row = session.get_current_row()
+                if current_row is None:
+                    break
+                row_idx, row_data = current_row
+            i = session.current_idx + 1
+
+            try:
+                breakdown = json.loads(row_data.get("breakdown_json", "[]"))
+            except json.JSONDecodeError:
+                breakdown = []
+
+            if not _skip_display:
+                sys.stdout.write("\033[H\033[J")
+                sys.stdout.flush()
+                if session._jump_row_data is not None:
+                    display_student(console, row_data, "ext", len(session.rows), breakdown)
+                else:
+                    display_student(console, row_data, i, len(session.rows), breakdown)
+
+                if rubric.exists():
+                    console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
+                else:
+                    console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
+
+                if session.append_uncertain_to_notes:
+                    console.print("  [dim]Uncertain auto-append: [green]ON[/green][/dim]")
+                else:
+                    console.print("  [dim]Uncertain auto-append: [yellow]OFF[/yellow] ([green]u[/green] to toggle)[/dim]")
+
+                _bottom_bar(console)
+
+            _skip_display = False
+
+            student_id = str(row_data["student_id"])
+            student_name = str(row_data["student_name"])
+            sub_file = find_submission_file(submissions, student_id, student_name, assignment_id=session.assignment_id)
+
+            action = Prompt.ask(
+                "",
+                default="skip",
+            )
+
+            # Inline commands: "R 7.17" or "j 解成" (bare "R"/"j" prompts for query)
+            action_stripped = action.strip()
+            if action_stripped.upper() in ("R", "RECALL") or action_stripped.upper().startswith("R ") or action_stripped.lower().startswith("recall "):
+                _, _, query = action_stripped.partition(" ")
+                query = query.strip()
+                if not query:
+                    query = Prompt.ask("[bold cyan]Recall: search notes for[/bold cyan]").strip()
+                if query:
+                    handle_recall(session, query, console)
+                _skip_display = True
+                continue
+            if action_stripped.lower() in ("j", "jump") or action_stripped.lower().startswith("j ") or action_stripped.lower().startswith("jump "):
+                _, _, query = action_stripped.partition(" ")
+                query = query.strip()
+                if not query:
+                    query = Prompt.ask("[bold cyan]Jump to student (name or ID)[/bold cyan]").strip()
+                if query:
+                    handle_jump(session, query, console)
+                continue
+
+            # External jump state: only allow view + notes actions
+            if session._jump_row_data is not None and action not in ("q", "quit", "n", "notes", "o", "open", "r", "rubric", "u"):
+                session._jump_row_data = None
+                console.print("[dim]Returned to review queue.[/dim]")
+                continue
+
+            if action in ("q", "quit"):
+                console.print("[yellow]Quitting...[/yellow]")
+                break
+
+            if action in ("b", "back"):
+                session.prev_student()
+                continue
+
+            if action in ("a", "approve"):
+                if handle_approve(session, row_idx, row_data, console):
+                    session.next_student()
+            elif action in ("n", "notes"):
+                handle_notes(session, row_idx, row_data, console)
+            elif action == "T":
+                handle_notes_prompt(session, row_idx, row_data, console)
+            elif action in ("e", "edit"):
+                breakdown = handle_edit(session, row_idx, row_data, breakdown, console)
+            elif action in ("o", "open") and sub_file:
+                open_file(sub_file, console)
+            elif action in ("r", "rubric"):
+                if rubric.exists():
+                    open_file(rubric, console)
+                else:
+                    console.print(f"[yellow]Rubric file not found: {rubric}[/yellow]")
+            elif action in ("ov", "override"):
+                handle_override(session, row_idx, row_data, console)
+            elif action == "u":
+                session.append_uncertain_to_notes = not session.append_uncertain_to_notes
+                _persist_env_bool("APPEND_UNCERTAIN_TO_NOTES", session.append_uncertain_to_notes)
+                console.print(f"[green]Uncertain auto-append toggled {'[ON]' if session.append_uncertain_to_notes else '[OFF]'}.[/green]")
+            else: # skip
+                console.print("[dim]Skipped.[/dim]")
+                session.next_student()
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]\nInterrupted by user (Ctrl-C)[/yellow]")
+
+    if session.modified:
+        console.print()
+        if Confirm.ask("[bold cyan]Save changes to spreadsheet?[/bold cyan]", default=True):
+            session.save_changes()
+            console.print(f"[green]Saved to {scores}[/green]")
+        else:
+            console.print("[yellow]Changes not saved.[/yellow]")
+    else:
+        console.print("[dim]No changes made.[/dim]")
+

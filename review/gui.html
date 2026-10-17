@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Review GUI</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #f5f5f5; color: #333; }
+header { background: #fff; border-bottom: 1px solid #ddd; padding: 8px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+header .nav { display: flex; align-items: center; gap: 8px; }
+header button { padding: 6px 14px; border: 1px solid #ccc; background: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; }
+header button:hover { background: #f0f0f0; }
+header button.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+header button.primary:hover { background: #1557b0; }
+header button.danger { background: #d93025; color: #fff; border-color: #d93025; }
+header button.danger:hover { background: #b3261e; }
+header .counter { font-size: 13px; color: #666; }
+header .student-label { font-weight: 600; font-size: 14px; flex: 1; }
+header .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+.badge-review { background: #fce8e6; color: #d93025; }
+.badge-ok { background: #e6f4ea; color: #137333; }
+.badge-late { background: #fef7e0; color: #ea8600; }
+.main { display: flex; flex: 1; overflow: hidden; }
+.pdf-panel { flex: 1; background: #e8e8e8; display: flex; align-items: center; justify-content: center; min-width: 0; }
+.pdf-panel embed { width: 100%; height: 100%; border: none; background: #fff; }
+.pdf-panel .no-pdf { color: #999; font-size: 16px; }
+.side-panel { width: 480px; min-width: 480px; overflow-y: auto; background: #fff; border-left: 1px solid #ddd; display: flex; flex-direction: column; }
+.side-panel section { padding: 12px 16px; border-bottom: 1px solid #eee; }
+.side-panel section:last-child { border-bottom: none; flex: 1; display: flex; flex-direction: column; }
+.side-panel h3 { font-size: 12px; text-transform: uppercase; color: #888; margin-bottom: 8px; letter-spacing: 0.5px; }
+table.breakdown { width: 100%; font-size: 13px; border-collapse: collapse; }
+table.breakdown th { text-align: left; color: #888; font-weight: 500; font-size: 11px; padding: 2px 4px; }
+table.breakdown td { padding: 3px 4px; border-top: 1px solid #f0f0f0; vertical-align: top; }
+table.breakdown tr:last-child td { font-weight: 600; border-top: 2px solid #ddd; }
+.score-total { font-size: 18px; font-weight: 700; }
+.score-total.override { color: #1a73e8; }
+.late-warn { color: #ea8600; font-size: 12px; margin-top: 4px; }
+.notes-area { flex: 1; display: flex; flex-direction: column; }
+.notes-area textarea { flex: 1; width: 100%; border: 1px solid #ccc; border-radius: 4px; padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; min-height: 120px; }
+.notes-area textarea:focus { outline: none; border-color: #1a73e8; }
+.deduction-bar { font-size: 12px; padding: 6px 0; display: flex; align-items: center; gap: 12px; }
+.deduction-bar .suggest { background: #e8f0fe; color: #1a73e8; padding: 2px 8px; border-radius: 4px; font-weight: 600; }
+.uncertain { background: #fef7e0; border-radius: 4px; padding: 8px; font-size: 12px; margin-top: 6px; }
+.uncertain h4 { color: #ea8600; font-size: 11px; margin-bottom: 4px; }
+.uncertain li { margin-left: 14px; margin-bottom: 2px; }
+.reasoning { font-size: 12px; color: #666; border-top: 1px solid #eee; max-height: 150px; overflow-y: auto; padding: 8px 16px; }
+.reasoning summary { cursor: pointer; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.actions { padding: 12px 16px; display: flex; gap: 8px; border-top: 1px solid #ddd; }
+.actions button { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+.actions .approve { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+.actions .approve:hover { background: #1557b0; }
+.actions .approve:disabled { background: #ccc; border-color: #ccc; cursor: default; }
+.actions .skip-btn { background: #fff; }
+.actions .skip-btn:hover { background: #f5f5f5; }
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #323232; color: #fff; padding: 10px 24px; border-radius: 6px; font-size: 14px; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 999; }
+.toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header id="header">
+  <div class="nav">
+    <button id="btn-prev" onclick="nav(-1)">← Prev</button>
+    <button id="btn-next" onclick="nav(1)">Next →</button>
+  </div>
+  <span class="counter" id="counter"></span>
+  <span class="student-label" id="student-label"></span>
+  <span class="badge" id="badge"></span>
+  <button id="btn-save" class="primary" onclick="save()">💾 Save & Next</button>
+</header>
+<div class="main">
+  <div class="pdf-panel" id="pdf-panel">
+    <span class="no-pdf">Loading PDF...</span>
+  </div>
+  <div class="side-panel" id="side-panel"></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let students = [];
+let currentIdx = 0;
+let dirty = false;
+
+function req(method, url, body) {
+  return fetch(url, {
+    method,
+    headers: body ? {"Content-Type": "application/json"} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+async function loadStudents() {
+  const resp = await req("GET", "/api/students");
+  students = await resp.json();
+  loadStudent(currentIdx);
+}
+
+async function loadStudent(idx) {
+  if (idx < 0 || idx >= students.length) return;
+  currentIdx = idx;
+  dirty = false;
+  const resp = await req("GET", `/api/student/${idx}`);
+  const s = await resp.json();
+  render(s);
+  updatePdf(idx);
+}
+
+function render(s) {
+  // Header
+  document.getElementById("counter").textContent = `${s.idx + 1} / ${s.total}`;
+  document.getElementById("student-label").textContent = `${s.student_name} (${s.student_id})`;
+  const badge = document.getElementById("badge");
+  badge.className = "badge";
+  if (s.approved) {
+    badge.textContent = "✓ Approved";
+    badge.classList.add("badge-ok");
+  } else if (s.needs_review) {
+    badge.textContent = "Needs Review";
+    badge.classList.add("badge-review");
+  } else {
+    badge.textContent = "Pending";
+    badge.classList.add("badge-ok");
+  }
+
+  const panel = document.getElementById("side-panel");
+  panel.innerHTML = "";
+
+  // Score breakdown
+  const bdSec = document.createElement("section");
+  let bdHtml = `<h3>Score Breakdown</h3>`;
+  let bdTotal = 0, bdMax = 0;
+  if (s.breakdown && s.breakdown.length) {
+    bdHtml += `<table class="breakdown"><tr><th>Criterion</th><th style="text-align:right">Score</th></tr>`;
+    for (const b of s.breakdown) {
+      bdTotal += b.points_awarded || 0;
+      bdMax += b.points_max || 0;
+      bdHtml += `<tr><td>${esc(b.criterion)}</td><td style="text-align:right">${fmt(b.points_awarded)} / ${fmt(b.points_max)}</td></tr>`;
+    }
+    bdHtml += `<tr><td><strong>Total</strong></td><td style="text-align:right"><strong>${fmt(bdTotal)} / ${fmt(bdMax)}</strong></td></tr>`;
+    bdHtml += `</table>`;
+  }
+  // Override indicator
+  if (s.reviewer_override_score !== null) {
+    bdHtml += `<div style="margin-top:6px;font-size:13px;color:#1a73e8;font-weight:600">Override: ${fmt(s.reviewer_override_score)} / ${fmt(s.total_max)}</div>`;
+  }
+  // Late info
+  if (s.late_days > 0) {
+    bdHtml += `<div class="late-warn">晚交 ${s.late_days} 天，扣 ${s.late_penalty} 分</div>`;
+  }
+  bdSec.innerHTML = bdHtml;
+  panel.appendChild(bdSec);
+
+  // Uncertain parts
+  if (s.uncertain_parts && s.uncertain_parts.length) {
+    const ucSec = document.createElement("section");
+    let ucHtml = `<div class="uncertain"><h4>⚠ Uncertain Parts</h4><ul>`;
+    for (const u of s.uncertain_parts) {
+      ucHtml += `<li>${esc(u.description)} (suggested: ${u.suggested_score}/${u.suggested_max})</li>`;
+    }
+    ucHtml += `</ul></div>`;
+    ucSec.innerHTML = ucHtml;
+    panel.appendChild(ucSec);
+  }
+
+  // Notes editor
+  const noteSec = document.createElement("section");
+  noteSec.className = "notes-area";
+  noteSec.innerHTML = `<h3>Reviewer Notes</h3>
+    <textarea id="notes" oninput="onNotesChange()">${esc(s.reviewer_notes || "")}</textarea>
+    <div class="deduction-bar" id="deduction-bar"></div>`;
+  panel.appendChild(noteSec);
+
+  // LLM reasoning (collapsible)
+  if (s.llm_reasoning) {
+    const rsSec = document.createElement("section");
+    rsSec.className = "reasoning";
+    rsSec.innerHTML = `<details><summary>LLM Reasoning</summary><p style="margin-top:6px">${esc(s.llm_reasoning)}</p></details>`;
+    panel.appendChild(rsSec);
+  }
+
+  // Update deduction bar
+  updateDeductions(s);
+}
+
+function updateDeductions(s) {
+  const notes = document.getElementById("notes").value;
+  const bar = document.getElementById("deduction-bar");
+  const matches = notes.matchAll(/扣\s*(\d+(?:\.\d+)?)\s*分/g);
+  let totalDeduction = 0;
+  for (const m of matches) totalDeduction += parseFloat(m[1]);
+
+  const totalMax = parseFloat(s.total_max) || 100;
+  const suggested = Math.max(0, totalMax - totalDeduction);
+  bar.innerHTML = `
+    <span>Detected deductions: <strong>${totalDeduction}</strong> pt(s)</span>
+    <span class="suggest">Suggested: ${fmt(suggested)} / ${fmt(totalMax)}</span>
+  `;
+}
+
+async function onNotesChange() {
+  dirty = true;
+  const resp = await req("GET", `/api/student/${currentIdx}`);
+  const s = await resp.json();
+  updateDeductions(s);
+}
+
+function updatePdf(idx) {
+  const panel = document.getElementById("pdf-panel");
+  panel.innerHTML = "";
+  const embed = document.createElement("embed");
+  embed.src = `/api/pdf/${idx}`;
+  embed.type = "application/pdf";
+  embed.onerror = () => { panel.innerHTML = `<span class="no-pdf">No PDF available</span>`; };
+  panel.appendChild(embed);
+}
+
+async function save() {
+  const notes = document.getElementById("notes").value;
+  await req("POST", `/api/student/${currentIdx}/save`, { reviewer_notes: notes });
+  toast("Saved");
+  dirty = false;
+  nav(1);
+}
+
+async function approve() {
+  await req("POST", `/api/student/${currentIdx}/save`, { approved: true });
+  toast("Approved ✓");
+  nav(1);
+}
+
+async function nav(delta) {
+  if (dirty) {
+    if (!confirm("Unsaved changes. Discard?")) return;
+    dirty = false;
+  }
+  const next = currentIdx + delta;
+  if (next < 0 || next >= students.length) {
+    toast(currentIdx === 0 ? "Already at first" : "Last student");
+    return;
+  }
+  loadStudent(next);
+}
+
+function esc(s) {
+  if (!s) return "";
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function fmt(n) {
+  if (n === null || n === undefined) return "";
+  return Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1);
+}
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2000);
+}
+
+// Keyboard
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey && e.key === "Enter") { e.preventDefault(); save(); }
+  if (e.key === "ArrowLeft" && e.altKey) { e.preventDefault(); nav(-1); }
+  if (e.key === "ArrowRight" && e.altKey) { e.preventDefault(); nav(1); }
+});
+
+loadStudents();
+</script>
+</body>
+</html>
