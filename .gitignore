@@ -19,8 +19,23 @@ student_list
 
 # Data files
 *.xlsx
+*.xls
+*.csv
 rubric*.md
 
 submissions/
 算分*.docx
 .~scores.xlsx
+
+# Local grading artifacts (semester-specific, may contain student data)
+*.log
+*.bak*
+*.pdf
+debug_*
+benchmark_results.json
+gc_*.csv
+副本*
+*报告*.md
+*评分标准*.docx
+教材/
+习题解答/
